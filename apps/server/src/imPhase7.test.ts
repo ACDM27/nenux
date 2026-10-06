@@ -28,9 +28,9 @@ function assertEq<T>(actual: T, expected: T, label: string): void {
 }
 function section(name: string): void { console.log(`\n── ${name} ──`); }
 
-// Mock WebSocket
+// Mock WebSocket (readyState=1 = OPEN)
 class MockWebSocket {
-  readyState = 1; // OPEN
+  readyState = 1;
   sent: string[] = [];
   send(data: string): void { this.sent.push(data); }
 }
@@ -41,9 +41,11 @@ function testSubscriptions(): void {
   section("Subscription Manager");
 
   const subs = createSubscriptionManager();
+  const wsA = new MockWebSocket() as unknown as import("ws").WebSocket;
+  const wsB = new MockWebSocket() as unknown as import("ws").WebSocket;
 
   // AC-7.1: 注册连接自动订阅 personal channel
-  registerConnection(subs, "0", "user-a");
+  registerConnection(subs, "0", "user-a", wsA);
   assert(subs.subscriptions.has("0"), "AC-7.1a: 连接已注册");
   assert(subs.subscriptions.get("0")!.has("personal:user-a"), "AC-7.1b: 自动订阅 personal:user-a");
   assertEq(subs.userIds.get("0"), "user-a", "AC-7.1c: userId 已记录");
@@ -57,13 +59,12 @@ function testSubscriptions(): void {
   assert(!subs.subscriptions.get("0")!.has("conversation:conv-1"), "AC-7.3: 取消订阅成功");
 
   // 注册第二个连接
-  registerConnection(subs, "1", "user-b");
+  registerConnection(subs, "1", "user-b", wsB);
   subscribe(subs, "1", "conversation:conv-1");
 
   // AC-7.4: 广播只到订阅者
-  const clients = new Set([new MockWebSocket(), new MockWebSocket()]);
   const delivered = broadcastToChannel(
-    subs, clients as unknown as Set<import("ws").WebSocket>,
+    subs,
     "conversation:conv-1",
     "im.message",
     { content: "hello" }
@@ -72,7 +73,7 @@ function testSubscriptions(): void {
 
   // AC-7.5: personal channel 广播
   const delivered2 = broadcastToChannel(
-    subs, clients as unknown as Set<import("ws").WebSocket>,
+    subs,
     "personal:user-a",
     "im.unread.update",
     { count: 5 }
@@ -91,14 +92,15 @@ function testClientMessages(): void {
   section("Client Message Handling");
 
   const subs = createSubscriptionManager();
-  const clients = new Set([new MockWebSocket(), new MockWebSocket()]);
+  const wsA = new MockWebSocket() as unknown as import("ws").WebSocket;
+  const wsB = new MockWebSocket() as unknown as import("ws").WebSocket;
 
-  registerConnection(subs, "0", "user-a");
-  registerConnection(subs, "1", "user-b");
+  registerConnection(subs, "0", "user-a", wsA);
+  registerConnection(subs, "1", "user-b", wsB);
 
   // AC-7.7: subscribe 消息
   handleClientMessage(
-    subs, clients as unknown as Set<import("ws").WebSocket>,
+    subs,
     "0",
     JSON.stringify({ type: "subscribe", channel: "conversation:conv-x" })
   );
@@ -106,7 +108,7 @@ function testClientMessages(): void {
 
   // AC-7.8: 鉴权 — 不能订阅别人的 personal channel
   handleClientMessage(
-    subs, clients as unknown as Set<import("ws").WebSocket>,
+    subs,
     "0",
     JSON.stringify({ type: "subscribe", channel: "personal:user-b" })
   );
@@ -114,7 +116,7 @@ function testClientMessages(): void {
 
   // AC-7.9: typing 事件转发
   handleClientMessage(
-    subs, clients as unknown as Set<import("ws").WebSocket>,
+    subs,
     "0",
     JSON.stringify({ type: "subscribe", channel: "conversation:conv-y" })
   );
@@ -122,17 +124,16 @@ function testClientMessages(): void {
 
   // 发送 typing，user-b 应该收到
   handleClientMessage(
-    subs, clients as unknown as Set<import("ws").WebSocket>,
+    subs,
     "0",
     JSON.stringify({ type: "typing", channel: "conversation:conv-y" })
   );
-  const wsB = Array.from(clients)[1] as MockWebSocket;
   const typingEvents = wsB.sent.filter((s) => JSON.parse(s).type === "im.typing");
   assert(typingEvents.length >= 1, `AC-7.9: typing 事件已转发 (${typingEvents.length} 次)`);
 
   // AC-7.10: 非法 JSON 不崩溃
   handleClientMessage(
-    subs, clients as unknown as Set<import("ws").WebSocket>,
+    subs,
     "0",
     "not json at all"
   );
@@ -145,16 +146,15 @@ function testOutboxDeliver(): void {
   section("Outbox Deliver Callback");
 
   const subs = createSubscriptionManager();
-  const clients = new Set([new MockWebSocket()]);
+  const ws = new MockWebSocket() as unknown as import("ws").WebSocket;
 
-  registerConnection(subs, "0", "user-a");
+  registerConnection(subs, "0", "user-a", ws);
   subscribe(subs, "0", "conversation:test-conv");
 
-  const deliver = createOutboxDeliver(subs, clients as unknown as Set<import("ws").WebSocket>);
+  const deliver = createOutboxDeliver(subs);
 
   // AC-7.11: deliver 回调正确广播
   deliver("conversation:test-conv", "im.message", JSON.stringify({ seq: 1, content: "hi" })).then(() => {
-    const ws = Array.from(clients)[0] as MockWebSocket;
     const events = ws.sent.filter((s) => {
       const parsed = JSON.parse(s);
       return parsed.type === "im.message" && parsed.channel === "conversation:test-conv";

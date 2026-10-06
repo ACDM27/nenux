@@ -5,7 +5,8 @@
  * AgentWorkspace / AgentPane 继续读 store，无需改动。
  * 写操作同时更新 store + 调 IM API（双向同步）。
  *
- * 使用方式：在 App 顶层调用 useImBridge()，一次挂载即可。
+ * 注意：WebSocket 连接和频道订阅由 Inbox 组件通过 useImWebSocket 统一管理，
+ * 本桥接层只负责数据层面的同步（IM API ↔ 主 store）。
  */
 
 import { useEffect, useRef, useCallback } from "react";
@@ -84,8 +85,7 @@ export function useImBridge() {
         if (!existing) {
           // 新会话 → 添加到 store
           addConversation(agentConv);
-          // 订阅该会话的 WebSocket 频道
-          ws.subscribe(`conversation:${imConv.id}`);
+          // WebSocket 频道订阅由 Inbox 组件的 useImWebSocket 统一管理
         }
         // 已有会话 → 暂不覆盖（保留用户自定义的 avatar/tags 等）
       }
@@ -94,7 +94,7 @@ export function useImBridge() {
     } finally {
       syncingRef.current = false;
     }
-  }, [userId, addConversation, ws]);
+  }, [userId, addConversation]);
 
   // ─── 消息同步：IM API → store ────────────────────────
 
@@ -191,6 +191,5 @@ export function useImBridge() {
     markReadSync,
     editMessageSync,
     deleteMessageSync,
-    wsConnected: ws !== null,
   };
 }
