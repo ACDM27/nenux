@@ -38,6 +38,9 @@ import type {
   MemberType,
 } from "@termany/core";
 
+/** 消息撤回时间窗口（毫秒），默认 5 分钟 */
+const RECALL_WINDOW_MS = 5 * 60 * 1000;
+
 // ─── Schema 迁移 ──────────────────────────────────────
 
 /**
@@ -619,16 +622,16 @@ export class ImService {
     return { ...msg, content, searchText, editedAt: ts };
   }
 
-  /** 撤回消息（仅发送者、2 分钟内） */
+  /** 撤回消息（仅发送者、RECALL_WINDOW_MS 内） */
   deleteMessage(messageId: number, senderId: string): void {
     const msg = this.getMessage(messageId);
     if (!msg) throw new Error("message not found");
     if (msg.senderId !== senderId) throw new Error("only sender can delete");
     if (msg.isDeleted) return; // 幂等
 
-    // 2 分钟窗口
-    if (now() - msg.createdAt > 2 * 60 * 1000) {
-      throw new Error("recall window expired (2 minutes)");
+    // 可配置的撤回窗口
+    if (now() - msg.createdAt > RECALL_WINDOW_MS) {
+      throw new Error(`recall window expired (${RECALL_WINDOW_MS / 60000} minutes)`);
     }
 
     this.db.exec("BEGIN");
@@ -971,6 +974,15 @@ export class ImService {
        SET status = ?, attempts = ?, lease_expires_at = ?, updated_at = ?
        WHERE event_id = ?`
     ).run(status, attempts, leaseExpires, now(), eventId);
+  }
+
+  /** 清理已投递的旧事件（防止 outbox 表膨胀） */
+  cleanupDeliveredEvents(olderThan: number): number {
+    const result = this.db.prepare(
+      `DELETE FROM im_event_outbox
+       WHERE status = 'delivered' AND updated_at < ?`
+    ).run(olderThan);
+    return result.changes;
   }
 
   // ─── Hydration（数据库行 → 领域对象） ────────────────

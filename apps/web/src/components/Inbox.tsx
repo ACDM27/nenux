@@ -18,6 +18,7 @@ import { useImStore } from "../imStore";
 import { useImWebSocket } from "../useImWebSocket";
 import { imApi, type ImConversation, type ImMessage } from "../imClient";
 import { SearchIcon, SendIcon, CloseIcon } from "./icons";
+import { useStore } from "../state/store";
 
 // ─── 常量 ──────────────────────────────────────────────
 
@@ -44,9 +45,17 @@ export function Inbox({ serverPort = 5175 }: InboxProps) {
     markAsRead, loadUnreadCounts,
     search, clearSearch,
     addReaction, removeReaction,
+    setUserId,
   } = useImStore();
 
   const { subscribe, unsubscribe, sendTyping } = useImWebSocket(serverPort);
+
+  // 从主 store 同步 userId（不再硬编码 "default-user"）
+  const userNickname = useStore((s) => s.userProfile.nickname);
+  useEffect(() => {
+    const id = userNickname?.trim() || "default-user";
+    setUserId(id);
+  }, [userNickname, setUserId]);
 
   useEffect(() => {
     loadConversations();
@@ -72,6 +81,7 @@ export function Inbox({ serverPort = 5175 }: InboxProps) {
   const [editContent, setEditContent] = useState("");
   const [searchInput, setSearchInput] = useState("");
   const [newConvOpen, setNewConvOpen] = useState(false);
+  const [highlightedMsgId, setHighlightedMsgId] = useState<number | null>(null);
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const messagesContainerRef = useRef<HTMLDivElement>(null);
 
@@ -139,6 +149,40 @@ export function Inbox({ serverPort = 5175 }: InboxProps) {
       clearSearch();
     }
   }, [searchInput, search, clearSearch, activeConversationId]);
+
+  // 搜索结果跳转：加载目标消息所在的分页，滚动到它并高亮
+  const jumpToSearchResult = useCallback(async (result: { messageId: number; conversationId: string; seq: number }) => {
+    // 如果不在同一个会话，先切换
+    if (result.conversationId !== activeConversationId) {
+      setActiveConversation(result.conversationId);
+    }
+    // 加载目标消息附近的分页
+    try {
+      const page = await imApi.getMessages(result.conversationId, {
+        beforeSeq: result.seq + 1,
+        limit: 40,
+        userId: useImStore.getState().userId,
+      });
+      useImStore.setState({
+        messages: page.items,
+        messagesHasMore: page.hasMore,
+        messagesNextCursor: page.nextCursor,
+        messagesLoading: false,
+      });
+      // 高亮目标消息（3秒后自动取消）
+      setHighlightedMsgId(result.messageId);
+      setTimeout(() => setHighlightedMsgId(null), 3000);
+      // 滚动到目标位置
+      requestAnimationFrame(() => {
+        const el = document.querySelector(`[data-msg-id="${result.messageId}"]`);
+        if (el) {
+          el.scrollIntoView({ behavior: "smooth", block: "center" });
+        }
+      });
+    } catch (e) {
+      console.error("[IM] jump to search result failed:", e);
+    }
+  }, [activeConversationId, setActiveConversation]);
 
   const activeConv = conversations.find((c) => c.id === activeConversationId);
   const totalUnread = Array.from(unreadCounts.values()).reduce((sum, n) => sum + n, 0);
@@ -244,6 +288,18 @@ export function Inbox({ serverPort = 5175 }: InboxProps) {
             {searchQuery && (
               <div className="im-search-banner">
                 <span>搜索 "{searchQuery}" — {searchResults.length} 条结果</span>
+                <div className="im-search-results-inline">
+                  {searchResults.slice(0, 5).map((r) => (
+                    <button
+                      key={r.messageId}
+                      className="im-search-result-chip"
+                      onClick={() => jumpToSearchResult(r)}
+                      title={r.content.slice(0, 80)}
+                    >
+                      #{r.seq} {r.content.slice(0, 30)}{r.content.length > 30 ? "..." : ""}
+                    </button>
+                  ))}
+                </div>
                 <button onClick={clearSearch}><CloseIcon /> 清除</button>
               </div>
             )}
@@ -274,6 +330,7 @@ export function Inbox({ serverPort = 5175 }: InboxProps) {
                       onDelete={() => deleteMessage(msg.id)}
                       onReaction={(emoji) => addReaction(msg.id, emoji)}
                       onRemoveReaction={(emoji) => removeReaction(msg.id, emoji)}
+                      highlighted={highlightedMsgId === msg.id}
                       onJumpToSearchResult={undefined}
                     />
                   </div>
@@ -326,6 +383,7 @@ export function Inbox({ serverPort = 5175 }: InboxProps) {
       {newConvOpen && (
         <NewConversationDialog
           onClose={() => setNewConvOpen(false)}
+          userId={useImStore.getState().userId}
           onCreated={(convId) => {
             setNewConvOpen(false);
             setActiveConversation(convId);
@@ -338,9 +396,10 @@ export function Inbox({ serverPort = 5175 }: InboxProps) {
 
 // ─── 新建会话 Dialog ────────────────────────────────────
 
-function NewConversationDialog({ onClose, onCreated }: {
+function NewConversationDialog({ onClose, onCreated, userId }: {
   onClose: () => void;
   onCreated: (convId: string) => void;
+  userId: string;
 }) {
   const [tab, setTab] = useState<NewConvTab>("dm");
   const [targetId, setTargetId] = useState("");
@@ -355,7 +414,7 @@ function NewConversationDialog({ onClose, onCreated }: {
     try {
       if (tab === "dm") {
         if (!targetId.trim()) { setError("请输入对方 ID"); setLoading(false); return; }
-        const conv = await imApi.createDm("default-user", targetId.trim());
+        const conv = await imApi.createDm(userId, targetId.trim());
         onCreated(conv.id);
       } else {
         if (!groupTitle.trim()) { setError("请输入群组名称"); setLoading(false); return; }
@@ -363,8 +422,8 @@ function NewConversationDialog({ onClose, onCreated }: {
           .map((id) => ({ id, type: "user" as const }));
         const conv = await imApi.createGroup(
           groupTitle.trim(),
-          "default-user",
-          [{ id: "default-user", type: "user", role: "owner" }, ...members]
+          userId,
+          [{ id: userId, type: "user", role: "owner" }, ...members]
         );
         onCreated(conv.id);
       }
@@ -373,7 +432,7 @@ function NewConversationDialog({ onClose, onCreated }: {
     } finally {
       setLoading(false);
     }
-  }, [tab, targetId, groupTitle, groupMembers, onCreated]);
+  }, [tab, targetId, groupTitle, groupMembers, userId, onCreated]);
 
   return (
     <div className="im-dialog-overlay" onClick={onClose}>
@@ -479,7 +538,7 @@ function ConversationRow({ conv, isActive, unread, onClick }: {
 
 // ─── 消息气泡 ───────────────────────────────────────────
 
-function MessageBubble({ msg, isOwn, isEditing, editContent, onEditContentChange, onStartEdit, onCancelEdit, onConfirmEdit, onDelete, onReaction, onRemoveReaction }: {
+function MessageBubble({ msg, isOwn, isEditing, editContent, onEditContentChange, onStartEdit, onCancelEdit, onConfirmEdit, onDelete, onReaction, onRemoveReaction, highlighted }: {
   msg: ImMessage;
   isOwn: boolean;
   isEditing: boolean;
@@ -492,6 +551,7 @@ function MessageBubble({ msg, isOwn, isEditing, editContent, onEditContentChange
   onReaction: (emoji: string) => void;
   onRemoveReaction: (emoji: string) => void;
   onJumpToSearchResult?: (() => void) | undefined;
+  highlighted?: boolean;
 }) {
   const [showActions, setShowActions] = useState(false);
   const [contextMenu, setContextMenu] = useState<{ x: number; y: number } | null>(null);
@@ -522,7 +582,8 @@ function MessageBubble({ msg, isOwn, isEditing, editContent, onEditContentChange
 
   return (
     <div
-      className={`im-msg-wrapper${isOwn ? " own" : ""}`}
+      className={`im-msg-wrapper${isOwn ? " own" : ""}${highlighted ? " highlighted" : ""}`}
+      data-msg-id={msg.id}
       onMouseEnter={() => setShowActions(true)}
       onMouseLeave={() => setShowActions(false)}
       onContextMenu={handleContextMenu}

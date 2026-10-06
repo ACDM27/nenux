@@ -11168,3 +11168,61 @@ html.tauri #root {
 .im-context-menu button:hover {
   background: var(--hover);
 }
+
+/* ─── 搜索结果内联展示 ─── */
+
+.im-search-banner {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 12px;
+  background: var(--hover);
+  border-bottom: 1px solid var(--border);
+  font-size: 12px;
+  color: var(--fg-muted);
+}
+
+.im-search-results-inline {
+  display: flex;
+  gap: 4px;
+  flex-wrap: wrap;
+  flex: 1;
+}
+
+.im-search-result-chip {
+  padding: 2px 8px;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  font-size: 11px;
+  color: var(--fg);
+  cursor: pointer;
+  max-width: 200px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.im-search-result-chip:hover {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+/* ─── 搜索结果高亮消息 ─── */
+
+.im-msg-wrapper.highlighted {
+  animation: im-highlight-flash 3s ease-out;
+}
+
+@keyframes im-highlight-flash {
+  0%, 20% {
+    background: color-mix(in srgb, var(--accent) 15%, transparent);
+    box-shadow: 0 0 0 2px var(--accent);
+    border-radius: 8px;
+  }
+  100% {
+    background: transparent;
+    box-shadow: none;
+  }
+}

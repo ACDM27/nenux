@@ -34,6 +34,10 @@ export class OutboxWorker {
   private imService: ImService;
   private pollIntervalMs: number;
   private batchSize: number;
+  /** 清理计数器：每 CLEANUP_EVERY_TICKS 轮清理一次已投递事件 */
+  private tickCount = 0;
+  private static readonly CLEANUP_EVERY_TICKS = 600; // ~5 分钟（500ms × 600）
+  private static readonly CLEANUP_OLDER_THAN_MS = 7 * 24 * 60 * 60 * 1000; // 7 天
 
   constructor(opts: OutboxWorkerOptions) {
     this.imService = opts.imService;
@@ -67,24 +71,47 @@ export class OutboxWorker {
 
     try {
       const events = this.imService.claimOutboxEvents(this.batchSize);
-      if (events.length === 0) return;
+      if (events.length === 0) {
+        // 无事件时也算一轮，推进清理计数
+        this.tickCount++;
+      } else {
+        // 并行投递，各自独立处理成功/失败
+        await Promise.allSettled(
+          events.map(async (event) => {
+            try {
+              await this.deliver(event.channel, event.eventType, event.payload);
+              this.imService.markOutboxDelivered(event.eventId);
+            } catch (e) {
+              console.warn(`[Outbox] delivery failed for ${event.eventId}:`, e);
+              this.imService.markOutboxRetry(event.eventId);
+            }
+          })
+        );
+        this.tickCount++;
+      }
 
-      // 并行投递，各自独立处理成功/失败
-      await Promise.allSettled(
-        events.map(async (event) => {
-          try {
-            await this.deliver(event.channel, event.eventType, event.payload);
-            this.imService.markOutboxDelivered(event.eventId);
-          } catch (e) {
-            console.warn(`[Outbox] delivery failed for ${event.eventId}:`, e);
-            this.imService.markOutboxRetry(event.eventId);
-          }
-        })
-      );
+      // 定期清理已投递的旧事件（防止 outbox 表无限膨胀）
+      if (this.tickCount >= OutboxWorker.CLEANUP_EVERY_TICKS) {
+        this.tickCount = 0;
+        this.cleanupOldEvents();
+      }
     } catch (e) {
       console.error("[Outbox] tick error:", e);
     } finally {
       this.processing = false;
+    }
+  }
+
+  /** 清理 7 天前已投递的事件 */
+  private cleanupOldEvents(): void {
+    try {
+      const cutoff = Date.now() - OutboxWorker.CLEANUP_OLDER_THAN_MS;
+      const deleted = this.imService.cleanupDeliveredEvents(cutoff);
+      if (deleted > 0) {
+        console.log(`[Outbox] Cleaned up ${deleted} delivered events older than 7 days`);
+      }
+    } catch (e) {
+      console.warn("[Outbox] cleanup failed:", e);
     }
   }
 }
