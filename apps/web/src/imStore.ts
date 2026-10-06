@@ -38,6 +38,9 @@ interface ImState {
   /** WebSocket 连接状态 */
   wsConnected: boolean;
 
+  /** 正在输入的用户（userId → 过期时间戳） */
+  typingUsers: Map<string, number>;
+
   /** 最近一次 IM 事件（供 UI 显示 toast） */
   lastEvent: { type: string; data: unknown } | null;
 }
@@ -102,6 +105,7 @@ export const useImStore = create<ImStore>((set, get) => ({
   searchQuery: "",
   searchLoading: false,
   wsConnected: false,
+  typingUsers: new Map(),
   lastEvent: null,
 
   // ─── Actions ──────────────────────────────────────────
@@ -316,15 +320,35 @@ export const useImStore = create<ImStore>((set, get) => ({
     switch (type) {
       case "im.message": {
         const convId = eventData.conversationId as string;
-        if (convId === state.activeConversationId) {
-          // 当前会话的新消息 → 追加
-          const msg = eventData as unknown as ImMessage;
-          if (msg.id && !state.messages.some((m) => m.id === msg.id)) {
-            state.appendMessage(msg);
-          }
+        const seq = eventData.seq as number;
+        if (!convId) break;
+
+        // WS 事件 payload 只有 { conversationId, seq, senderId }，
+        // 必须通过 API 回拉完整消息（content/metadata/reactions 等）
+        if (convId === state.activeConversationId && seq) {
+          imApi.getMessages(convId, { beforeSeq: seq + 1, limit: 1, userId: state.userId })
+            .then((page) => {
+              if (page.items.length === 0) return;
+              const msg = page.items[0];
+              const current = get();
+              if (!current.messages.some((m) => m.id === msg.id)) {
+                current.appendMessage(msg);
+              }
+            })
+            .catch((e) => console.error("[IM] fetch new message failed:", e));
         }
-        // 更新未读计数
+
+        // 更新会话预览 + 未读计数
+        if (seq) {
+          set((s) => ({
+            conversations: s.conversations.map((c) =>
+              c.id === convId ? { ...c, latestSeq: Math.max(c.latestSeq, seq) } : c
+            ),
+          }));
+        }
         state.loadUnreadCounts();
+        // 后台刷新会话列表（更新 preview）
+        state.loadConversations();
         break;
       }
       case "im.message.deleted": {
@@ -334,14 +358,44 @@ export const useImStore = create<ImStore>((set, get) => ({
       }
       case "im.message.edited": {
         const msgId = eventData.messageId as number;
-        const content = eventData.content as string;
-        if (msgId && content) {
-          state.updateMessage(msgId, { content, editedAt: Date.now() });
+        if (msgId) {
+          // 通过 API 拿最新内容（事件 payload 可能不含完整 content）
+          imApi.getMessages(state.activeConversationId ?? "", { limit: 100, userId: state.userId })
+            .then((page) => {
+              const msg = page.items.find((m) => m.id === msgId);
+              if (msg) get().updateMessage(msgId, { content: msg.content, editedAt: msg.editedAt });
+            })
+            .catch(() => {
+              // fallback: 直接用事件中可能的 content
+              const content = eventData.content as string;
+              if (content) get().updateMessage(msgId, { content, editedAt: Date.now() });
+            });
         }
         break;
       }
       case "im.unread.update": {
         state.loadUnreadCounts();
+        break;
+      }
+      case "im.typing": {
+        // Typing 事件 → 记录到 typingUsers，2 秒后自动清除
+        const convId = eventData.conversationId as string;
+        const typingUserId = (eventData as any).userId as string;
+        if (convId && typingUserId && convId === state.activeConversationId) {
+          set((s) => {
+            const next = new Map(s.typingUsers);
+            next.set(typingUserId, Date.now() + 2000);
+            return { typingUsers: next };
+          });
+          // 2 秒后自动清除
+          setTimeout(() => {
+            set((s) => {
+              const next = new Map(s.typingUsers);
+              next.delete(typingUserId);
+              return { typingUsers: next };
+            });
+          }, 2500);
+        }
         break;
       }
       case "im.reaction.added":

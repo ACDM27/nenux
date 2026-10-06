@@ -25,5 +25,10 @@
   "devDependencies": {
     "concurrently": "^9.1.0",
     "esbuild": "^0.24.2"
+  },
+  "dependencies": {
+    "@termany/web": "workspace:^",
+    "react-virtualized-auto-sizer": "^2.0.3",
+    "react-window": "^2.3.3"
   }
 }

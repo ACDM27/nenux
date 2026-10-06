@@ -10892,3 +10892,279 @@ html.tauri #root {
   background: var(--accent);
   color: var(--bg);
 }
+
+/* ─── 新建会话按钮 ─── */
+
+.im-sidebar-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.im-new-conv-btn {
+  background: none;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 2px 8px;
+  cursor: pointer;
+  font-size: 14px;
+  color: var(--fg-muted);
+  transition: all 0.15s;
+}
+
+.im-new-conv-btn:hover {
+  background: var(--hover);
+  color: var(--fg);
+  border-color: var(--fg-muted);
+}
+
+.im-empty-create-btn {
+  margin-top: 8px;
+  padding: 6px 16px;
+  background: var(--accent);
+  color: var(--bg);
+  border: none;
+  border-radius: 6px;
+  cursor: pointer;
+  font-size: 13px;
+  transition: opacity 0.15s;
+}
+
+.im-empty-create-btn:hover {
+  opacity: 0.85;
+}
+
+/* ─── 新建会话 Dialog ─── */
+
+.im-dialog-overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.5);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 1000;
+  backdrop-filter: blur(2px);
+}
+
+.im-dialog {
+  background: var(--bg-surface, var(--bg));
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  width: 400px;
+  max-width: 90vw;
+  box-shadow: 0 8px 32px rgba(0, 0, 0, 0.3);
+  display: flex;
+  flex-direction: column;
+}
+
+.im-dialog-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 14px 16px 10px;
+  border-bottom: 1px solid var(--border);
+}
+
+.im-dialog-header h3 {
+  margin: 0;
+  font-size: 15px;
+  font-weight: 600;
+}
+
+.im-dialog-close {
+  background: none;
+  border: none;
+  cursor: pointer;
+  color: var(--fg-muted);
+  padding: 2px;
+}
+
+.im-dialog-close:hover {
+  color: var(--fg);
+}
+
+.im-dialog-tabs {
+  display: flex;
+  padding: 0 16px;
+  gap: 0;
+  border-bottom: 1px solid var(--border);
+}
+
+.im-dialog-tab {
+  padding: 8px 16px;
+  background: none;
+  border: none;
+  border-bottom: 2px solid transparent;
+  cursor: pointer;
+  color: var(--fg-muted);
+  font-size: 13px;
+  transition: all 0.15s;
+}
+
+.im-dialog-tab.active {
+  color: var(--accent);
+  border-bottom-color: var(--accent);
+}
+
+.im-dialog-tab:hover:not(.active) {
+  color: var(--fg);
+}
+
+.im-dialog-body {
+  padding: 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.im-dialog-field label {
+  display: block;
+  font-size: 12px;
+  color: var(--fg-muted);
+  margin-bottom: 4px;
+}
+
+.im-dialog-field input,
+.im-dialog-field textarea {
+  width: 100%;
+  padding: 8px 10px;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  color: var(--fg);
+  font-size: 13px;
+  outline: none;
+  box-sizing: border-box;
+}
+
+.im-dialog-field input:focus,
+.im-dialog-field textarea:focus {
+  border-color: var(--accent);
+}
+
+.im-dialog-error {
+  color: #e53e3e;
+  font-size: 12px;
+  padding: 4px 0;
+}
+
+.im-dialog-footer {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  padding: 12px 16px;
+  border-top: 1px solid var(--border);
+}
+
+.im-dialog-footer button {
+  padding: 6px 16px;
+  border-radius: 6px;
+  border: 1px solid var(--border);
+  background: var(--bg);
+  color: var(--fg);
+  cursor: pointer;
+  font-size: 13px;
+}
+
+.im-dialog-footer button:hover {
+  background: var(--hover);
+}
+
+.im-dialog-primary {
+  background: var(--accent) !important;
+  color: var(--bg) !important;
+  border-color: var(--accent) !important;
+}
+
+.im-dialog-primary:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+/* ─── Typing 指示器 ─── */
+
+.im-typing-indicator {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 16px;
+  color: var(--fg-muted);
+  font-size: 12px;
+  font-style: italic;
+}
+
+.im-typing-dots {
+  display: inline-flex;
+  gap: 3px;
+}
+
+.im-typing-dots span {
+  width: 5px;
+  height: 5px;
+  background: var(--fg-muted);
+  border-radius: 50%;
+  animation: im-typing-bounce 1.4s infinite ease-in-out;
+}
+
+.im-typing-dots span:nth-child(1) { animation-delay: 0s; }
+.im-typing-dots span:nth-child(2) { animation-delay: 0.2s; }
+.im-typing-dots span:nth-child(3) { animation-delay: 0.4s; }
+
+@keyframes im-typing-bounce {
+  0%, 60%, 100% { transform: translateY(0); opacity: 0.4; }
+  30% { transform: translateY(-4px); opacity: 1; }
+}
+
+/* ─── 日期分隔线 ─── */
+
+.im-date-separator {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 12px 0;
+}
+
+.im-date-separator span {
+  font-size: 11px;
+  color: var(--fg-muted);
+  background: var(--bg-surface, var(--bg));
+  padding: 2px 12px;
+  border-radius: 10px;
+  border: 1px solid var(--border);
+}
+
+/* ─── 右键菜单 ─── */
+
+.im-context-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 999;
+}
+
+.im-context-menu {
+  position: fixed;
+  z-index: 1000;
+  background: var(--bg-surface, var(--bg));
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.2);
+  padding: 4px 0;
+  min-width: 140px;
+}
+
+.im-context-menu button {
+  display: block;
+  width: 100%;
+  padding: 6px 12px;
+  background: none;
+  border: none;
+  text-align: left;
+  cursor: pointer;
+  font-size: 13px;
+  color: var(--fg);
+}
+
+.im-context-menu button:hover {
+  background: var(--hover);
+}
