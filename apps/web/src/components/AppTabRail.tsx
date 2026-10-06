@@ -2,9 +2,9 @@ import { useI18n } from "../i18n";
 import { unreadAgentMessages } from "../agentPrivateMessages";
 import { useStore } from "../state/store";
 import { toggleWorkspaceSwitcher } from "../workspaceSwitcherEvents";
-import { AgentIcon, TerminalIcon } from "./icons";
+import { AgentIcon, TerminalIcon, DirectChatIcon } from "./icons";
 
-export type AppTab = "pages" | "agents";
+export type AppTab = "pages" | "agents" | "messages";
 
 /** Top-level product navigation. It stays visible in both workspaces, so Pages
  * and Agent conversations feel like peer destinations rather than a pane mode. */
@@ -51,6 +51,17 @@ export function AppTabRail({
         <span className="app-tab-icon" aria-hidden="true">
           <AgentIcon />
           {unread > 0 && <span className="app-tab-unread">{unread > 99 ? "99+" : unread}</span>}
+        </span>
+      </button>
+      <button
+        className={`app-tab-button app-tab-messages ${active === "messages" ? "active" : ""}`}
+        aria-label="IM Messages"
+        aria-current={active === "messages" ? "page" : undefined}
+        title="IM Messages"
+        onClick={() => onChange("messages")}
+      >
+        <span className="app-tab-icon" aria-hidden="true">
+          <DirectChatIcon />
         </span>
       </button>
       <button

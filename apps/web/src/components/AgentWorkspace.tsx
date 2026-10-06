@@ -28,11 +28,16 @@ import { useI18n } from "../i18n";
 import { useImeGuard } from "../imeGuard";
 import { fetchConfiguredDefaultModel } from "../modelConfig";
 import { useNativeOccluder } from "../nativeViewOcclusion";
+import { apiPath } from "../api";
 import { useStore, type AgentConversation } from "../state/store";
+import { useTerminalTranscriptSync } from "../useTerminalTranscriptSync";
+import { useImBridge } from "../imAdapter";
 import { AgentPane } from "./AgentPane";
 import { AgentLauncher } from "./AgentLauncher";
 import { AgentGroupDialog } from "./AgentGroupDialog";
 import { AgentAvatar, AgentAvatarEditor } from "./AgentIdentityFields";
+import { ChatGPTLogin } from "./ChatGPTLogin";
+import { CodexConversation } from "./CodexConversation";
 import {
   AgentIcon,
   CheckIcon,
@@ -118,7 +123,12 @@ export function AgentWorkspace({ workspaceId, visible = true }: { workspaceId: s
   const { t } = useI18n();
   const allConversations = useStore((s) => s.agentConversations);
   const userProfile = useStore((s) => s.userProfile);
+  const { sessions: terminalSessions } = useTerminalTranscriptSync();
   const firstWorkspaceId = useStore((s) => s.workspaces[0]?.id ?? "");
+
+  // ─── IM 桥接：从 IM API 同步会话/消息到 store ─────────
+  const imBridge = useImBridge();
+
   const conversations = useMemo(
     () =>
       allConversations.filter(
@@ -156,6 +166,8 @@ export function AgentWorkspace({ workspaceId, visible = true }: { workspaceId: s
   const [query, setQuery] = useState("");
   const [inboxFilter, setInboxFilter] = useState<AgentInboxFilter>("all");
   const [filterOpen, setFilterOpen] = useState(false);
+  const [showCodex, setShowCodex] = useState(false);
+  const [codexLoggedIn, setCodexLoggedIn] = useState(false);
   const [dialogStage, setDialogStage] = useState<AgentDialogStage | null>(() =>
     conversations.length === 0 ? "picker" : null
   );
@@ -510,6 +522,13 @@ export function AgentWorkspace({ workspaceId, visible = true }: { workspaceId: s
     setActiveId(conversations[0]?.id ?? "");
   }, [activeId, conversations]);
 
+  // ─── 切换会话时从 IM API 加载消息 ─────────────────────
+  useEffect(() => {
+    if (activeId) {
+      imBridge.syncMessages(activeId);
+    }
+  }, [activeId, imBridge]);
+
   useEffect(() => {
     const timer = window.setInterval(() => setNow(Date.now()), 60_000);
     return () => window.clearInterval(timer);
@@ -576,11 +595,15 @@ export function AgentWorkspace({ workspaceId, visible = true }: { workspaceId: s
     setTopicTitleDraft("");
     setTopicMenu(null);
   }, [active?.id, inspectorOpen]);
+
   const markRead = useStore((state) => state.markAgentConversationRead);
   const hasUnreadConversations = conversations.some((conversation) => unreadAgentMessages(conversation) > 0);
   const markAllRead = () => {
     conversations.forEach((conversation) => {
-      if (unreadAgentMessages(conversation) > 0) markRead(conversation.id);
+      if (unreadAgentMessages(conversation) > 0) {
+        markRead(conversation.id);
+        imBridge.markReadSync(conversation.id);
+      }
     });
     setFilterOpen(false);
   };
@@ -588,7 +611,10 @@ export function AgentWorkspace({ workspaceId, visible = true }: { workspaceId: s
   useEffect(() => {
     const read = () => {
       if (visible && active && !isConversationStreaming(active.id) && unreadAgentMessages(active) &&
-        document.visibilityState === "visible" && document.hasFocus()) markRead(active.id);
+        document.visibilityState === "visible" && document.hasFocus()) {
+        markRead(active.id);
+        imBridge.markReadSync(active.id);
+      }
     };
     read();
     window.addEventListener("focus", read);
@@ -597,7 +623,7 @@ export function AgentWorkspace({ workspaceId, visible = true }: { workspaceId: s
       window.removeEventListener("focus", read);
       document.removeEventListener("visibilitychange", read);
     };
-  }, [active, markRead, streamingIds, visible]);
+  }, [active, markRead, streamingIds, visible, imBridge]);
   // "" is an explicit pick of Termany's own assistant; undefined predates the
   // picker and still follows the first configured runtime.
   const runtimeIcon = (id: string | undefined) =>
@@ -1267,6 +1293,15 @@ export function AgentWorkspace({ workspaceId, visible = true }: { workspaceId: s
               </label>
               <button
                 type="button"
+                className={`agent-inbox-add ${showCodex ? "active" : ""}`}
+                title="ChatGPT Codex"
+                aria-label="ChatGPT Codex"
+                onClick={() => setShowCodex(!showCodex)}
+              >
+                🤖
+              </button>
+              <button
+                type="button"
                 className="agent-inbox-add"
                 title={t("agentWorkspace.new")}
                 aria-label={t("agentWorkspace.new")}
@@ -1293,6 +1328,55 @@ export function AgentWorkspace({ workspaceId, visible = true }: { workspaceId: s
                     onDrop={(event) => moveDraggedConversation(event, { pinned: true })}
                   >
                     {pinnedConversations.map(renderPinnedConversation)}
+                  </div>
+                </section>
+              )}
+
+              {/* Terminal Sessions (synced from Terminal view) */}
+              {terminalSessions.length > 0 && (
+                <section className="agent-folder-section" aria-label="Terminal Sessions">
+                  <div className="agent-folder-heading">
+                    <button
+                      type="button"
+                      className="agent-folder-toggle"
+                      aria-expanded={true}
+                    >
+                      <span>🖥️ Terminal</span>
+                      <ChevronIcon dir="down" />
+                    </button>
+                  </div>
+                  <div className="agent-terminal-sessions">
+                    {terminalSessions.map((session) => (
+                      <div
+                        key={session.id}
+                        className={`agent-inbox-row ${session.status === "working" ? "working" : ""}`}
+                        data-agent-conversation-id={`terminal:${session.id}`}
+                      >
+                        <button className="agent-inbox-pick">
+                          <span className="agent-inbox-avatar">
+                            <span className="agent-avatar-terminal">
+                              {session.agent === "claude" ? "🟠" : session.agent === "codex" ? "🟢" : "⚪"}
+                            </span>
+                            {session.status === "working" && (
+                              <span className="agent-inbox-loading" aria-label="Working">
+                                <SpinnerIcon />
+                              </span>
+                            )}
+                          </span>
+                          <span className="agent-inbox-copy">
+                            <span className="agent-inbox-line">
+                              <strong>{session.agent} (Terminal)</strong>
+                              <time>{new Date(session.startedAt).toLocaleTimeString()}</time>
+                            </span>
+                            <span className="agent-inbox-preview">
+                              {session.messages.length > 0
+                                ? `${session.messages.length} messages`
+                                : "Waiting for messages..."}
+                            </span>
+                          </span>
+                        </button>
+                      </div>
+                    ))}
                   </div>
                 </section>
               )}
@@ -1504,7 +1588,15 @@ export function AgentWorkspace({ workspaceId, visible = true }: { workspaceId: s
           )}
         </header>
         <div className="agent-conversation-body">
-          {active ? (
+          {showCodex ? (
+            codexLoggedIn ? (
+              <CodexConversation />
+            ) : (
+              <div className="agent-conversation-empty">
+                <ChatGPTLogin onLoginSuccess={() => setCodexLoggedIn(true)} />
+              </div>
+            )
+          ) : active ? (
             conversations
               .filter((conversation) => conversation.id === active.id || isConversationPaneStreaming(conversation.id))
               .flatMap((conversation) => {

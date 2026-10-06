@@ -11,12 +11,32 @@ import { createServer, type ServerResponse } from "node:http";
 import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
+import { randomUUID } from "node:crypto";
 import { AgentActivityTracker } from "./agentActivity.js";
+import { getTranscriptSync, type TerminalSession } from "./agentTranscriptSync.js";
 import { detectAgentExecutable, detectCommandExecutable, parseAgentDetectionInput } from "./agentDetection.js";
 import { sampleOnceOutputSettles } from "./foregroundJob.js";
 import { DEFAULT_SESSION_PAGE_SIZE, listAgentSessions, listAgentUsage } from "./agentSessions.js";
 import { streamAgentChat } from "./agentChat.js";
 import { listAgentConfigs, saveAgentConfigs } from "./agentConfig.js";
+import {
+  startOAuthFlow,
+  startOAuthFlowAsync,
+  getValidCredentials,
+  type ChatGPTCredentials,
+} from "./chatgptOAuth.js";
+import {
+  saveCredentials,
+  loadCredentials,
+  clearCredentials,
+  hasCredentials,
+} from "./chatgptCredentialStore.js";
+import {
+  streamCodexResponse,
+  testCodexConnection,
+  CODEX_MODELS,
+  type CodexModel,
+} from "./chatgptCodexProvider.js";
 import {
   acpRuntimeConfig,
   acpRuntimeCwd,
@@ -58,7 +78,19 @@ import {
   setScreenBatch,
   setScrollBatch,
   setSessionCwd,
+  getDb,
 } from "./db.js";
+import { migrateImSchema, ImService } from "./imService.js";
+import { OutboxWorker } from "./imOutbox.js";
+import { HandoffService } from "./imHandoff.js";
+import { splitIntoBubbles } from "./imBubbleSplit.js";
+import {
+  createSubscriptionManager,
+  registerConnection,
+  unregisterConnection,
+  createOutboxDeliver,
+  handleClientMessage,
+} from "./imEvents.js";
 import { gitDiffs, gitOverview, worktreeOverview } from "./git.js";
 import { pickFolder } from "./folderPicker.js";
 import { pickFiles } from "./filePicker.js";
@@ -409,6 +441,40 @@ const activityInstance = `${process.pid}-${Date.now().toString(36)}`;
 let activityRevision = 0;
 const activityTracker = new AgentActivityTracker({ onChange: activityChanged });
 const sshPortForwarding = new SshPortForwarding();
+const transcriptSync = getTranscriptSync();
+
+// Wire up transcript sync events to SSE
+const transcriptStreams = new Set<ServerResponse>();
+transcriptSync.on("sessionStarted", (session) => {
+  transcriptSyncChanged();
+});
+transcriptSync.on("sessionUpdated", (session) => {
+  transcriptSyncChanged();
+});
+transcriptSync.on("sessionEnded", (sessionId) => {
+  transcriptSyncChanged();
+});
+
+function transcriptSyncPayload() {
+  return {
+    sessions: transcriptSync.getAllSessions(),
+  };
+}
+
+function transcriptSyncEvent(): string {
+  return `event: transcript\ndata: ${JSON.stringify(transcriptSyncPayload())}\n\n`;
+}
+
+function transcriptSyncChanged(): void {
+  const event = transcriptSyncEvent();
+  for (const stream of transcriptStreams) {
+    try {
+      stream.write(event);
+    } catch {
+      transcriptStreams.delete(stream);
+    }
+  }
+}
 
 function activityPayload() {
   return {
@@ -533,6 +599,8 @@ function wireSession(id: string | undefined, session: PtySession): void {
     if (id) {
       activityTracker.noteExit(id, exitCode, signal);
       sshPortForwarding.remove(id);
+      // Stop transcript sync when session exits
+      transcriptSync.stopSession(id);
       // Natural exit — flush final history so it still restores as plain
       // scrollback (cwd/history stay in the DB; only /api/forget wipes them).
       if (session.ring.dirty) {
@@ -553,6 +621,7 @@ function wireSession(id: string | undefined, session: PtySession): void {
 function killSession(id: string): void {
   activityTracker.remove(id);
   sshPortForwarding.remove(id);
+  transcriptSync.stopSession(id);
   const session = ptySessions.get(id);
   if (!session) return;
   if (session.ring.dirty) {
@@ -629,9 +698,16 @@ function flushScroll(): void {
 
 setInterval(flushScroll, 10_000).unref();
 
+// ─── IM 消息系统初始化 ─────────────────────────────────
+// 迁移 schema + 创建服务实例 + 启动 outbox worker
+const imDb = getDb();
+migrateImSchema(imDb);
+const imService = new ImService(imDb);
+const handoffService = new HandoffService(imDb, imService);
+
 // One HTTP server hosts both the WebSocket upgrade (PTY sessions) and a small
 // JSON API (POST /api/theme — AI theme generation, key stays server-side).
-const http = createServer((req, res) => {
+const http = createServer(async (req, res) => {
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Methods", "GET, POST, PUT, OPTIONS");
   res.setHeader("Access-Control-Allow-Headers", "Content-Type, X-Image-Type");
@@ -694,6 +770,172 @@ const http = createServer((req, res) => {
     res.write(activityEvent());
     res.on("close", () => activityStreams.delete(res));
     res.on("error", () => activityStreams.delete(res));
+    return;
+  }
+  if (req.method === "GET" && reqUrl.pathname === "/api/transcript/events") {
+    res.writeHead(200, {
+      "Content-Type": "text/event-stream",
+      "Cache-Control": "no-cache, no-transform",
+      Connection: "keep-alive",
+    });
+    transcriptStreams.add(res);
+    res.write("retry: 1000\n");
+    res.write(transcriptSyncEvent());
+    res.on("close", () => transcriptStreams.delete(res));
+    res.on("error", () => transcriptStreams.delete(res));
+    return;
+  }
+  if (req.method === "POST" && reqUrl.pathname === "/api/transcript/start") {
+    readJson(req)
+      .then((body) => {
+        const terminalId = typeof body?.terminalId === "string" ? body.terminalId.trim() : "";
+        const agent = typeof body?.agent === "string" ? body.agent.trim() : "";
+        const cwd = typeof body?.cwd === "string" ? body.cwd.trim() : "";
+        if (!terminalId || !agent || !cwd) {
+          json(400, { error: "terminalId, agent, and cwd are required" });
+          return;
+        }
+        if (agent !== "claude" && agent !== "codex") {
+          json(400, { error: "Unsupported agent. Only claude and codex are supported." });
+          return;
+        }
+        transcriptSync.startSession(terminalId, agent, cwd)
+          .then(() => {
+            json(200, { ok: true, session: transcriptSync.getSession(terminalId) });
+          })
+          .catch((err) => {
+            json(500, { error: String(err) });
+          });
+      })
+      .catch(fail);
+    return;
+  }
+  if (req.method === "POST" && reqUrl.pathname === "/api/transcript/stop") {
+    readJson(req)
+      .then((body) => {
+        const terminalId = typeof body?.terminalId === "string" ? body.terminalId.trim() : "";
+        if (!terminalId) {
+          json(400, { error: "terminalId is required" });
+          return;
+        }
+        transcriptSync.stopSession(terminalId);
+        json(200, { ok: true });
+      })
+      .catch(fail);
+    return;
+  }
+  if (req.method === "GET" && reqUrl.pathname === "/api/transcript/sessions") {
+    json(200, { sessions: transcriptSync.getAllSessions() });
+    return;
+  }
+
+  // =========================================================================
+  // ChatGPT OAuth & Codex API
+  // =========================================================================
+
+  // Get ChatGPT login status
+  if (req.method === "GET" && reqUrl.pathname === "/api/chatgpt/status") {
+    const hasCreds = hasCredentials();
+    let valid = false;
+    if (hasCreds) {
+      const creds = loadCredentials();
+      if (creds) {
+        const validCreds = await getValidCredentials(creds);
+        valid = validCreds !== null;
+        if (validCreds && validCreds.accessToken !== creds.accessToken) {
+          // Token was refreshed, save new credentials
+          saveCredentials(validCreds);
+        }
+      }
+    }
+    json(200, { loggedIn: hasCreds && valid });
+    return;
+  }
+
+  // Start ChatGPT OAuth flow - return auth URL, don't wait for callback
+  if (req.method === "POST" && reqUrl.pathname === "/api/chatgpt/login") {
+    try {
+      // Generate PKCE and state, start callback server in background
+      const authUrl = await startOAuthFlowAsync();
+      json(200, { ok: true, authUrl });
+    } catch (error) {
+      json(500, { error: String(error) });
+    }
+    return;
+  }
+
+  // Logout from ChatGPT
+  if (req.method === "POST" && reqUrl.pathname === "/api/chatgpt/logout") {
+    clearCredentials();
+    json(200, { ok: true });
+    return;
+  }
+
+  // Get available Codex models
+  if (req.method === "GET" && reqUrl.pathname === "/api/chatgpt/models") {
+    json(200, { models: CODEX_MODELS });
+    return;
+  }
+
+  // Test ChatGPT Codex connection
+  if (req.method === "POST" && reqUrl.pathname === "/api/chatgpt/test") {
+    const creds = loadCredentials();
+    if (!creds) {
+      json(401, { error: "Not logged in" });
+      return;
+    }
+    const validCreds = await getValidCredentials(creds);
+    if (!validCreds) {
+      json(401, { error: "Invalid or expired credentials" });
+      return;
+    }
+    const result = await testCodexConnection(validCreds);
+    json(200, result);
+    return;
+  }
+
+  // Stream Codex response (SSE)
+  if (req.method === "POST" && reqUrl.pathname === "/api/chatgpt/codex") {
+    readJson(req)
+      .then(async (body) => {
+        const creds = loadCredentials();
+        if (!creds) {
+          json(401, { error: "Not logged in" });
+          return;
+        }
+        const validCreds = await getValidCredentials(creds);
+        if (!validCreds) {
+          json(401, { error: "Invalid or expired credentials" });
+          return;
+        }
+        if (validCreds.accessToken !== creds.accessToken) {
+          saveCredentials(validCreds);
+        }
+
+        const model = (body?.model as CodexModel) || "gpt-5.4";
+        const messages = Array.isArray(body?.messages) ? body.messages : [];
+
+        // Set up SSE response
+        res.writeHead(200, {
+          "Content-Type": "text/event-stream",
+          "Cache-Control": "no-cache",
+          Connection: "keep-alive",
+        });
+
+        try {
+          for await (const chunk of streamCodexResponse(validCreds, model, messages)) {
+            res.write(`data: ${JSON.stringify(chunk)}\n\n`);
+            if (chunk.type === "done" || chunk.type === "error") {
+              break;
+            }
+          }
+          res.end();
+        } catch (error) {
+          res.write(`data: ${JSON.stringify({ type: "error", error: String(error) })}\n\n`);
+          res.end();
+        }
+      })
+      .catch(fail);
     return;
   }
   if (req.method === "POST" && reqUrl.pathname === "/api/activity/register") {
@@ -1677,6 +1919,364 @@ const http = createServer((req, res) => {
     return;
   }
 
+  // ─── IM 消息系统 API ────────────────────────────────────
+
+  // 会话列表
+  if (req.method === "GET" && reqUrl.pathname === "/api/im/conversations") {
+    try {
+      const userId = reqUrl.searchParams.get("user_id") || "default-user";
+      const limit = Number(reqUrl.searchParams.get("limit") || "50");
+      const conversations = imService.listConversations(userId, limit);
+      json(200, { ok: true, data: conversations });
+    } catch (e) { fail(e); }
+    return;
+  }
+
+  // 创建 DM
+  if (req.method === "POST" && reqUrl.pathname === "/api/im/conversations/dm") {
+    readJson(req).then((body) => {
+      try {
+        const conv = imService.createDm({
+          userId: String(body?.userId ?? "default-user"),
+          targetId: String(body?.targetId ?? ""),
+          targetType: body?.targetType === "bot" ? "bot" : "user",
+        });
+        json(200, { ok: true, data: conv });
+      } catch (e) { fail(e); }
+    }).catch(fail);
+    return;
+  }
+
+  // 创建群组
+  if (req.method === "POST" && reqUrl.pathname === "/api/im/conversations/group") {
+    readJson(req).then((body) => {
+      try {
+        const conv = imService.createGroup({
+          title: String(body?.title ?? ""),
+          ownerId: String(body?.ownerId ?? "default-user"),
+          members: Array.isArray(body?.members) ? body.members : [],
+          clientRequestId: body?.clientRequestId,
+        });
+        json(200, { ok: true, data: conv });
+      } catch (e) { fail(e); }
+    }).catch(fail);
+    return;
+  }
+
+  // 获取单个会话
+  if (req.method === "GET" && reqUrl.pathname.startsWith("/api/im/conversations/") && reqUrl.pathname.split("/").length === 5) {
+    try {
+      const convId = reqUrl.pathname.split("/")[4];
+      const conv = imService.getConversation(convId);
+      if (!conv) { json(404, { error: "conversation not found" }); return; }
+      json(200, { ok: true, data: conv });
+    } catch (e) { fail(e); }
+    return;
+  }
+
+  // 获取消息历史（cursor 分页）
+  if (req.method === "GET" && reqUrl.pathname.match(/^\/api\/im\/conversations\/[^/]+\/messages$/)) {
+    try {
+      const parts = reqUrl.pathname.split("/");
+      const convId = parts[4];
+      const beforeSeq = reqUrl.searchParams.get("before_seq");
+      const limit = Number(reqUrl.searchParams.get("limit") || "40");
+      const userId = reqUrl.searchParams.get("user_id") || "default-user";
+
+      const page = imService.getMessages(convId, {
+        beforeSeq: beforeSeq ? Number(beforeSeq) : undefined,
+        limit,
+        userId,
+      });
+      json(200, { ok: true, data: page });
+    } catch (e) { fail(e); }
+    return;
+  }
+
+  // 发送消息
+  if (req.method === "POST" && reqUrl.pathname.match(/^\/api\/im\/conversations\/[^/]+\/messages$/)) {
+    readJson(req).then((body) => {
+      try {
+        const parts = reqUrl.pathname.split("/");
+        const convId = parts[4];
+        const msg = imService.sendMessage(convId, {
+          senderId: String(body?.senderId ?? "default-user"),
+          senderType: body?.senderType === "agent" ? "agent" : "user",
+          role: body?.role === "assistant" ? "assistant" : "user",
+          content: String(body?.content ?? ""),
+          messageType: body?.messageType ?? "text",
+          metadata: body?.metadata ?? {},
+          replyToSeq: body?.replyToSeq ? Number(body.replyToSeq) : undefined,
+          clientRequestId: body?.clientRequestId,
+        });
+        json(200, { ok: true, data: msg });
+      } catch (e) { fail(e); }
+    }).catch(fail);
+    return;
+  }
+
+  // 编辑消息
+  if (req.method === "PUT" && reqUrl.pathname.match(/^\/api\/im\/messages\/\d+$/)) {
+    readJson(req).then((body) => {
+      try {
+        const msgId = Number(reqUrl.pathname.split("/")[3]);
+        const senderId = String(body?.senderId ?? "default-user");
+        const msg = imService.editMessage(msgId, senderId, String(body?.content ?? ""));
+        json(200, { ok: true, data: msg });
+      } catch (e) { fail(e); }
+    }).catch(fail);
+    return;
+  }
+
+  // 撤回消息
+  if (req.method === "DELETE" && reqUrl.pathname.match(/^\/api\/im\/messages\/\d+$/)) {
+    try {
+      const msgId = Number(reqUrl.pathname.split("/")[3]);
+      const senderId = reqUrl.searchParams.get("sender_id") || "default-user";
+      imService.deleteMessage(msgId, senderId);
+      json(200, { ok: true });
+    } catch (e) { fail(e); }
+    return;
+  }
+
+  // 标记已读
+  if (req.method === "POST" && reqUrl.pathname.match(/^\/api\/im\/conversations\/[^/]+\/read$/)) {
+    readJson(req).then((body) => {
+      try {
+        const convId = reqUrl.pathname.split("/")[3];
+        const userId = String(body?.userId ?? "default-user");
+        const seq = Number(body?.seq ?? 0);
+        imService.markAsRead(convId, userId, seq);
+        json(200, { ok: true });
+      } catch (e) { fail(e); }
+    }).catch(fail);
+    return;
+  }
+
+  // 未读计数
+  if (req.method === "GET" && reqUrl.pathname === "/api/im/unread-counts") {
+    try {
+      const userId = reqUrl.searchParams.get("user_id") || "default-user";
+      const counts = imService.getUnreadCounts(userId);
+      json(200, { ok: true, data: counts });
+    } catch (e) { fail(e); }
+    return;
+  }
+
+  // 搜索
+  if (req.method === "GET" && reqUrl.pathname === "/api/im/search") {
+    try {
+      const query = reqUrl.searchParams.get("q") || "";
+      const convId = reqUrl.searchParams.get("conversation_id") || undefined;
+      const limit = Number(reqUrl.searchParams.get("limit") || "20");
+      if (!query) { json(200, { ok: true, data: [] }); return; }
+      const results = imService.search(query, { conversationId: convId, limit });
+      json(200, { ok: true, data: results });
+    } catch (e) { fail(e); }
+    return;
+  }
+
+  // 置顶会话
+  if (req.method === "POST" && reqUrl.pathname.match(/^\/api\/im\/conversations\/[^/]+\/pin$/)) {
+    readJson(req).then((body) => {
+      try {
+        const convId = reqUrl.pathname.split("/")[3];
+        const userId = String(body?.userId ?? "default-user");
+        const pinned = body?.pinned !== false;
+        imService.pinConversation(convId, userId, pinned);
+        json(200, { ok: true });
+      } catch (e) { fail(e); }
+    }).catch(fail);
+    return;
+  }
+
+  // 静音会话
+  if (req.method === "POST" && reqUrl.pathname.match(/^\/api\/im\/conversations\/[^/]+\/mute$/)) {
+    readJson(req).then((body) => {
+      try {
+        const convId = reqUrl.pathname.split("/")[3];
+        const userId = String(body?.userId ?? "default-user");
+        const muted = body?.muted !== false;
+        imService.muteConversation(convId, userId, muted);
+        json(200, { ok: true });
+      } catch (e) { fail(e); }
+    }).catch(fail);
+    return;
+  }
+
+  // 表情回应
+  if (req.method === "POST" && reqUrl.pathname.match(/^\/api\/im\/messages\/\d+\/reactions$/)) {
+    readJson(req).then((body) => {
+      try {
+        const msgId = Number(reqUrl.pathname.split("/")[3]);
+        const userId = String(body?.userId ?? "default-user");
+        const emoji = String(body?.emoji ?? "");
+        if (body?.remove) {
+          imService.removeReaction(msgId, userId, emoji);
+        } else {
+          imService.addReaction(msgId, userId, emoji);
+        }
+        json(200, { ok: true });
+      } catch (e) { fail(e); }
+    }).catch(fail);
+    return;
+  }
+
+  // 置顶消息
+  if (req.method === "POST" && reqUrl.pathname.match(/^\/api\/im\/messages\/\d+\/pin$/)) {
+    readJson(req).then((body) => {
+      try {
+        const msgId = Number(reqUrl.pathname.split("/")[3]);
+        const pinned = body?.pinned !== false;
+        imService.pinMessage(msgId, pinned);
+        json(200, { ok: true });
+      } catch (e) { fail(e); }
+    }).catch(fail);
+    return;
+  }
+
+  // 获取置顶消息
+  if (req.method === "GET" && reqUrl.pathname.match(/^\/api\/im\/conversations\/[^/]+\/pinned$/)) {
+    try {
+      const convId = reqUrl.pathname.split("/")[3];
+      const messages = imService.getPinnedMessages(convId);
+      json(200, { ok: true, data: messages });
+    } catch (e) { fail(e); }
+    return;
+  }
+
+  // ─── 气泡拆分 API ──────────────────────────────────────
+
+  // 预览气泡拆分（不写入，仅返回拆分结果）
+  if (req.method === "POST" && reqUrl.pathname === "/api/im/messages/split-preview") {
+    readJson(req).then((body) => {
+      try {
+        const content = String(body?.content ?? "");
+        const result = splitIntoBubbles(content, {
+          maxBubbles: Number(body?.maxBubbles ?? 4),
+          minChars: Number(body?.minChars ?? 50),
+        });
+        json(200, { ok: true, data: result });
+      } catch (e) { fail(e); }
+    }).catch(fail);
+    return;
+  }
+
+  // 发送气泡拆分后的多条消息
+  if (req.method === "POST" && reqUrl.pathname.match(/^\/api\/im\/conversations\/[^/]+\/messages\/split$/)) {
+    readJson(req).then((body) => {
+      try {
+        const parts = reqUrl.pathname.split("/");
+        const convId = parts[4];
+        const content = String(body?.content ?? "");
+        const replyGroupId = randomUUID();
+        const split = splitIntoBubbles(content, { replyGroupId });
+
+        const messages = split.parts.map((part) =>
+          imService.sendMessage(convId, {
+            senderId: String(body?.senderId ?? "default-user"),
+            senderType: body?.senderType === "agent" ? "agent" : "user",
+            role: body?.role === "assistant" ? "assistant" : "user",
+            content: part,
+            replyGroupId,
+          })
+        );
+
+        json(200, { ok: true, data: { replyGroupId, messages } });
+      } catch (e) { fail(e); }
+    }).catch(fail);
+    return;
+  }
+
+  // ─── 侧链 API ──────────────────────────────────────────
+
+  // 创建侧链
+  if (req.method === "POST" && reqUrl.pathname.match(/^\/api\/im\/conversations\/[^/]+\/sidechains$/)) {
+    try {
+      const convId = reqUrl.pathname.split("/")[3];
+      const sidechainId = imService.createSidechain(convId);
+      json(200, { ok: true, data: { sidechainId } });
+    } catch (e) { fail(e); }
+    return;
+  }
+
+  // 获取侧链消息
+  if (req.method === "GET" && reqUrl.pathname.match(/^\/api\/im\/conversations\/[^/]+\/sidechains\/[^/]+$/)) {
+    try {
+      const parts = reqUrl.pathname.split("/");
+      const convId = parts[4];
+      const sidechainId = parts[6];
+      const messages = imService.getSidechainMessages(convId, sidechainId);
+      json(200, { ok: true, data: messages });
+    } catch (e) { fail(e); }
+    return;
+  }
+
+  // 列出侧链
+  if (req.method === "GET" && reqUrl.pathname.match(/^\/api\/im\/conversations\/[^/]+\/sidechains$/)) {
+    try {
+      const convId = reqUrl.pathname.split("/")[3];
+      const sidechains = imService.listSidechains(convId);
+      json(200, { ok: true, data: sidechains });
+    } catch (e) { fail(e); }
+    return;
+  }
+
+  // ─── Handoff 跨 Agent 接力 API ──────────────────────────
+
+  // 预览接力
+  if (req.method === "POST" && reqUrl.pathname === "/api/im/handoffs/preview") {
+    readJson(req).then((body) => {
+      try {
+        const snapshot = handoffService.prepareHandoff(
+          String(body?.conversationId ?? ""),
+          String(body?.sourceAgentId ?? ""),
+          (body?.targetAgent === "codex" ? "codex" : "claude-code"),
+          {
+            mode: body?.mode === "llm" ? "llm" : "rules",
+            handoffNote: String(body?.handoffNote ?? ""),
+            projectPath: String(body?.projectPath ?? ""),
+          }
+        );
+        const rendered = handoffService.renderPreview(snapshot);
+        json(200, { ok: true, data: { snapshot, rendered } });
+      } catch (e) { fail(e); }
+    }).catch(fail);
+    return;
+  }
+
+  // 执行接力
+  if (req.method === "POST" && reqUrl.pathname === "/api/im/handoffs") {
+    readJson(req).then((body) => {
+      try {
+        const snapshot = handoffService.prepareHandoff(
+          String(body?.conversationId ?? ""),
+          String(body?.sourceAgentId ?? ""),
+          (body?.targetAgent === "codex" ? "codex" : "claude-code"),
+          {
+            mode: body?.mode === "llm" ? "llm" : "rules",
+            handoffNote: String(body?.handoffNote ?? ""),
+            projectPath: String(body?.projectPath ?? ""),
+          }
+        );
+        const result = handoffService.executeHandoff(snapshot);
+        json(200, { ok: true, data: result });
+      } catch (e) { fail(e); }
+    }).catch(fail);
+    return;
+  }
+
+  // 列出接力记录
+  if (req.method === "GET" && reqUrl.pathname === "/api/im/handoffs") {
+    try {
+      const convId = reqUrl.searchParams.get("conversation_id") || undefined;
+      const limit = Number(reqUrl.searchParams.get("limit") || "20");
+      const handoffs = handoffService.listHandoffs(convId, limit);
+      json(200, { ok: true, data: handoffs });
+    } catch (e) { fail(e); }
+    return;
+  }
+
   res.writeHead(404).end();
 });
 
@@ -1710,6 +2310,16 @@ http.on("error", (err: NodeJS.ErrnoException) => {
 });
 
 const wss = new WebSocketServer({ server: http });
+
+// ─── IM 事件广播系统 ──────────────────────────────────────
+const imSubs = createSubscriptionManager();
+
+// Outbox Worker 使用订阅管理器投递事件
+const imOutboxWorker = new OutboxWorker({
+  imService,
+  deliver: createOutboxDeliver(imSubs),
+});
+imOutboxWorker.start();
 
 let connCount = 0;
 
@@ -1919,12 +2529,52 @@ wss.on("connection", async (ws: WebSocket, req) => {
   const sshTarget = url.searchParams.get("ssh");
   const agent = url.searchParams.get("agent") ?? undefined;
 
+  // ─── IM 事件订阅注册 ──────────────────────────────────
+  // 每个 WebSocket 连接自动注册到 IM 事件系统
+  // userId 从 URL query 获取（?user=xxx），默认为 "default-user"
+  const imUserId = url.searchParams.get("user") || "default-user";
+  const imConnId = String(cid);
+  registerConnection(imSubs, imConnId, imUserId, ws);
+
+  // 处理 IM 订阅消息（subscribe/unsubscribe/typing）
+  ws.on("message", (raw: Buffer) => {
+    try {
+      const msg = JSON.parse(raw.toString());
+      console.log(`[IM] 📨 Client #${cid} message:`, msg.type, msg.channel);
+      if (msg.type === "subscribe" || msg.type === "unsubscribe" || msg.type === "typing") {
+        handleClientMessage(imSubs, imConnId, raw.toString());
+      }
+    } catch {
+      // 非 JSON 消息 → PTY 输入，由下游处理
+    }
+  });
+
+  // ─── IM-only 连接：不创建 PTY，只保持 WS 用于事件推送 ──
+  if (url.searchParams.get("im") === "1") {
+    console.log(`[IM] 🟢 Client #${cid} connected (user=${imUserId}, origin=${req.headers.origin || "none"})`);
+    ws.on("close", () => {
+      unregisterConnection(imSubs, imConnId);
+      console.log(`[IM] 🔴 Client #${cid} disconnected`);
+    });
+    ws.on("error", (err) => {
+      console.log(`[IM] ❌ Client #${cid} error:`, err.message);
+    });
+    return; // 不走 PTY 流程
+  }
+
   // --- Reattach: the session's shell is still running (detached or stolen
   // from a stale connection) — resume it instead of spawning a fresh one.
   const existing = sessionId ? ptySessions.get(sessionId) : undefined;
   if (existing && existing.sshTarget === sshTarget) {
     console.log(`[termany] client #${cid} reattached to session ${sessionId} (pid ${existing.pty.pid})`);
     activityTracker.bindAgent(sessionId!, agent);
+    // Auto-start transcript sync for supported agents
+    if (agent && (agent === "claude" || agent === "codex") && sessionId) {
+      const cwd = existing.cwd || process.cwd();
+      transcriptSync.startSession(sessionId, agent as "claude" | "codex", cwd).catch((err) => {
+        console.warn(`[termany] Failed to start transcript sync for ${sessionId}:`, err);
+      });
+    }
     if (existing.ws && existing.ws !== ws) {
       try {
         existing.ws.close();
@@ -1959,6 +2609,7 @@ wss.on("connection", async (ws: WebSocket, req) => {
       }
     });
     ws.on("close", () => {
+      unregisterConnection(imSubs, imConnId);
       if (existing.ws !== ws) return; // a newer connection already replaced us
       existing.ws = null;
       existing.detachedAt = Date.now();
@@ -2020,6 +2671,7 @@ wss.on("connection", async (ws: WebSocket, req) => {
   });
 
   ws.on("close", () => {
+    unregisterConnection(imSubs, imConnId);
     closed = true;
     if (!session) return;
     if (!sessionId) {
@@ -2104,7 +2756,16 @@ wss.on("connection", async (ws: WebSocket, req) => {
   if (sessionId && sshTarget && sshConnectionArgs) {
     sshPortForwarding.register(sessionId, sshConnectionArgs, sshControlPath);
   }
-  if (sessionId) activityTracker.bindAgent(sessionId, agent);
+  if (sessionId) {
+    activityTracker.bindAgent(sessionId, agent);
+    // Auto-start transcript sync for supported agents
+    if (agent && (agent === "claude" || agent === "codex")) {
+      const cwd = session.cwd || process.cwd();
+      transcriptSync.startSession(sessionId, agent as "claude" | "codex", cwd).catch((err) => {
+        console.warn(`[termany] Failed to start transcript sync for ${sessionId}:`, err);
+      });
+    }
+  }
   wireSession(sessionId ?? undefined, session);
 
   pendingMessages.splice(0).forEach(applyClientMessage);

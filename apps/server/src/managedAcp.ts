@@ -1,9 +1,13 @@
 import { createRequire } from "node:module";
 import fs from "node:fs";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 import { agentEnvironment } from "./agentEnvironment.js";
 import type { AgentConfig } from "./agentConfig.js";
 import { resolveExecutable } from "./shellPath.js";
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
 
 type ManagedAcpDefinition = {
   packageName: string;
@@ -47,12 +51,21 @@ export function managedAcpAdapterPath(agentId: string): string | undefined {
   const bundled = path.join(path.dirname(process.execPath), "acp", definition.bundleName);
   if (fs.existsSync(bundled)) return bundled;
 
-  try {
-    const requireFromCwd = createRequire(path.join(process.cwd(), "package.json"));
-    return requireFromCwd.resolve(definition.packageEntry);
-  } catch {
-    return undefined;
+  // Try resolving from the server's package.json first (pnpm workspace),
+  // then fall back to cwd (monorepo root or installed app).
+  const serverPackageJson = path.join(__dirname, "..", "package.json");
+  const searchPaths = [serverPackageJson, path.join(process.cwd(), "package.json")];
+
+  for (const pkgJsonPath of searchPaths) {
+    try {
+      if (!fs.existsSync(pkgJsonPath)) continue;
+      const req = createRequire(pkgJsonPath);
+      return req.resolve(definition.packageEntry);
+    } catch {
+      continue;
+    }
   }
+  return undefined;
 }
 
 /**

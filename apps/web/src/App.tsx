@@ -4,6 +4,7 @@ import { GitDiff } from "./components/GitDiff";
 import { HTabBar } from "./components/HTabBar";
 import { AgentWorkspace } from "./components/AgentWorkspace";
 import { AppTabRail, type AppTab } from "./components/AppTabRail";
+import { Inbox } from "./components/Inbox";
 import { QuitConfirm } from "./components/QuitConfirm";
 import { ResizeHandles } from "./components/ResizeHandles";
 import { SearchPalette } from "./components/SearchPalette";
@@ -83,7 +84,9 @@ const APP_TAB_STORAGE_KEY = "termany.app-tab";
 
 function loadAppTab(): AppTab {
   try {
-    return localStorage.getItem(APP_TAB_STORAGE_KEY) === "agents" ? "agents" : "pages";
+    const saved = localStorage.getItem(APP_TAB_STORAGE_KEY);
+    if (saved === "agents" || saved === "messages") return saved;
+    return "pages";
   } catch {
     return "pages";
   }
@@ -467,6 +470,9 @@ export function App() {
       )}
       {botEnabled && <div className="agent-workspace-host" hidden={appTab !== "agents"}>
         <AgentWorkspace key={activeWorkspaceId} workspaceId={activeWorkspaceId} visible={appTab === "agents"} />
+      </div>}
+      {botEnabled && <div className="agent-workspace-host" hidden={appTab !== "messages"}>
+        <Inbox serverPort={5175} />
       </div>}
       {settingsOpen && (
         <Settings

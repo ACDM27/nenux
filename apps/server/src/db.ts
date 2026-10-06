@@ -20,6 +20,9 @@ const db = new DatabaseSync(path.join(DIR, "termany.db"));
 // per commit); NORMAL sync is the standard pairing and still crash-safe in WAL.
 db.exec("PRAGMA journal_mode = WAL");
 db.exec("PRAGMA synchronous = NORMAL");
+// 启用外键约束：im_message.conversation_id → im_conversation.id 等
+// SQLite 默认不执行 FOREIGN KEY，必须显式开启
+db.exec("PRAGMA foreign_keys = ON");
 db.exec(`
   CREATE TABLE IF NOT EXISTS workspace (id TEXT PRIMARY KEY, pos INTEGER NOT NULL, data TEXT NOT NULL);
   CREATE TABLE IF NOT EXISTS app_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
@@ -247,6 +250,14 @@ export function setScreenBatch(screens: Record<string, string | null>): void {
 }
 
 /** Drop all restore data for sessions the user has permanently closed. */
+/**
+ * 导出原始 db 实例，供 IM 服务层直接使用。
+ * IM 模块需要自行执行 DDL 和事务操作。
+ */
+export function getDb(): DatabaseSync {
+  return db;
+}
+
 export function forgetSessions(ids: string[]): void {
   if (!Array.isArray(ids) || !ids.length) return;
   db.exec("BEGIN");

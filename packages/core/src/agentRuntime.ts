@@ -9,6 +9,10 @@ export type AgentRuntimeConfig = {
   protocol: "acp-http";
   endpoint: string;
   apiKey: string;
+} | {
+  /** ChatGPT OAuth - uses ChatGPT Plus/Pro subscription via OAuth. */
+  protocol: "chatgpt-oauth";
+  model: string;
 };
 
 export const AGENT_RUNTIME_REVISION = 6;
@@ -27,7 +31,8 @@ const BUILTIN_RUNTIMES: Record<string, RuntimePreset> = {
   // Termany ships these small ACP bridges and points them at the user's CLI.
   // This avoids requiring system Node/npx or downloading a second agent binary.
   claude: managed("claude-agent-acp", 1),
-  codex: managed("codex-acp", 1),
+  // Codex uses ChatGPT OAuth - no local CLI needed, uses ChatGPT Plus/Pro subscription
+  codex: { protocol: "chatgpt-oauth", model: "gpt-5.6-sol", revision: 7 },
   opencode: stdio("opencode", "acp", 1),
   gemini: stdio("gemini", "--acp", 2),
   kimi: stdio("kimi", "acp", 2),

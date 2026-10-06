@@ -31,6 +31,7 @@ import { prepareManagedAcpLaunch } from "./managedAcp.js";
 import { stopAgentProcess } from "./agentProcess.js";
 import { loadAgentImages, saveAgentOutputImages, type LoadedAgentImage, type StoredAgentImage } from "./agentImages.js";
 import { FastClawRuntime } from "./fastClawRuntime.js";
+import { ChatGPTOAuthRuntime } from "./chatgptOAuthRuntime.js";
 
 export type AcpRuntimeEvent =
   | { type: "delta"; text: string }
@@ -528,7 +529,7 @@ class Runtime {
   }
 }
 
-type RuntimeHandle = Runtime | FastClawRuntime;
+type RuntimeHandle = Runtime | FastClawRuntime | ChatGPTOAuthRuntime;
 
 const runtimes = new Map<string, RuntimeHandle>();
 interface SuspendedRuntime {
@@ -641,6 +642,8 @@ async function acquire(input: AcpRuntimeTarget): Promise<RuntimeHandle> {
   const promise: Promise<RuntimeHandle> = (async () => {
     const runtime = agent.runtime?.protocol === "acp-http"
       ? await FastClawRuntime.create(input.paneId, agent, cwd)
+      : agent.runtime?.protocol === "chatgpt-oauth"
+      ? await ChatGPTOAuthRuntime.create(input.paneId, agent, cwd)
       : await Runtime.create(input.paneId, agent, cwd, saved);
     try {
       if (starting.get(input.paneId) !== promise) throw new Error("Agent conversation was closed during startup");
@@ -678,7 +681,8 @@ export function acpRuntimeConfig(input: AcpRuntimeTarget): SessionConfigOption[]
   if (live && live.agent.id === input.agentId) return live.config;
   const saved = suspended.get(input.paneId);
   if (saved && saved.agent.id === input.agentId) return withPicks(saved.config, input.config ?? {});
-  if (findAgentConfig(input.agentId)?.runtime?.protocol === "acp-http") return null;
+  const protocol = findAgentConfig(input.agentId)?.runtime?.protocol;
+  if (protocol === "acp-http" || protocol === "chatgpt-oauth") return null;
   const cached = cachedConfig(input.agentId);
   return cached && withPicks(cached, input.config ?? {});
 }
@@ -701,7 +705,8 @@ export async function setAcpConfigOption(
 ): Promise<SessionConfigOption[]> {
   const live = runtimes.get(input.paneId);
   if (live && live.agent.id === input.agentId) return useRuntime(input, (runtime) => runtime.setConfigOption(input.configId, input.value));
-  if (findAgentConfig(input.agentId)?.runtime?.protocol === "acp-http") {
+  const protocol = findAgentConfig(input.agentId)?.runtime?.protocol;
+  if (protocol === "acp-http" || protocol === "chatgpt-oauth") {
     return useRuntime(input, (runtime) => runtime.setConfigOption(input.configId, input.value));
   }
   const saved = suspended.get(input.paneId);
