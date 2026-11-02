@@ -11,7 +11,7 @@ test("group sessions isolate members and track each Bot's updated model without 
   const db = await import("./db.js");
   home.mock.restore();
   const { promptAcpRuntime, closeAllAcpRuntimes } = await import("./acpRuntime.js");
-  t.after(async () => { closeAllAcpRuntimes(); await fs.rm(directory, { recursive: true, force: true }); });
+  t.after(async () => { closeAllAcpRuntimes(); db.getDb().close(); await fs.rm(directory, { recursive: true, force: true, maxRetries: 20, retryDelay: 100 }); });
   db.setAgentsRaw(JSON.stringify([{
     id: "test", name: "Test", command: process.execPath, args: "", enabled: true,
     runtime: { protocol: "acp", distribution: "custom", modelSource: "agent", command: process.execPath,

@@ -1,4 +1,4 @@
-import { loadConfig, type Provider } from "./config.js";
+import { loadConfig, type Provider, type ModelsConfig } from "./config.js";
 import { botIdentityPrompt } from "./botIdentity.js";
 import { loadAgentImages, type AgentImageInput, type LoadedAgentImage } from "./agentImages.js";
 
@@ -146,9 +146,10 @@ export async function streamAgentChat(
   rawMessages: unknown,
   signal: AbortSignal,
   onText: (text: string) => void,
-  botIdentity?: unknown
+  botIdentity?: unknown,
+  configuration?: ModelsConfig
 ): Promise<{ model: string }> {
-  const cfg = loadConfig();
+  const cfg = configuration ?? loadConfig();
   const selected = requestedModel || cfg.defaultModel;
   const slash = selected.indexOf("/");
   if (slash <= 0) throw new Error("No model configured — open Model settings first");

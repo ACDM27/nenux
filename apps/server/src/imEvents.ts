@@ -11,6 +11,7 @@ import type { WebSocket } from "ws";
 
 /** 客户端订阅的频道（连接级别的内存状态） */
 export interface ClientSubscriptions {
+  canAccess?: (conversationId: string, userId: string) => boolean;
   /** 连接 ID → 订阅的 channel 集合 */
   subscriptions: Map<string, Set<string>>;
   /** 连接 ID → userId（用于 personal channel 鉴权） */
@@ -20,8 +21,9 @@ export interface ClientSubscriptions {
 }
 
 /** 创建订阅管理器 */
-export function createSubscriptionManager(): ClientSubscriptions {
+export function createSubscriptionManager(canAccess?: ClientSubscriptions["canAccess"]): ClientSubscriptions {
   return {
+    canAccess,
     subscriptions: new Map(),
     userIds: new Map(),
     sockets: new Map(),
@@ -79,6 +81,10 @@ export function broadcastToChannel(
     Array.from(subs.subscriptions.entries()).map(([id, channels]) => ({id, channels: [...channels]})));
 
   for (const [connId, channels] of subs.subscriptions) {
+    if (channel.startsWith("conversation:") && subs.canAccess && !subs.canAccess(channel.slice("conversation:".length), subs.userIds.get(connId) || "")) {
+      channels.delete(channel);
+      continue;
+    }
     if (!channels.has(channel)) {
       console.log(`[IM]   ⏭️  Client ${connId} not subscribed to ${channel}`);
       continue;
@@ -120,7 +126,8 @@ export function createOutboxDeliver(
 export function handleClientMessage(
   subs: ClientSubscriptions,
   connId: string,
-  raw: string
+  raw: string,
+  canAccess?: (conversationId: string, userId: string) => boolean
 ): void {
   let msg: { type: string; channel?: string };
   try {
@@ -137,6 +144,7 @@ export function handleClientMessage(
   if (channel.startsWith("personal:") && channel !== `personal:${userId}`) {
     return;
   }
+  if (channel.startsWith("conversation:") && canAccess && !canAccess(channel.slice("conversation:".length), userId || "")) return;
 
   switch (msg.type) {
     case "subscribe":
@@ -146,7 +154,9 @@ export function handleClientMessage(
       unsubscribe(subs, connId, channel);
       break;
     case "typing":
-      broadcastToChannel(subs, channel, "im.typing", { userId });
+      broadcastToChannel(subs, channel, "im.typing", {
+        userId, conversationId: channel.startsWith("conversation:") ? channel.slice("conversation:".length) : undefined,
+      });
       break;
   }
 }

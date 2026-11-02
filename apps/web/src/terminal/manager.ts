@@ -54,7 +54,11 @@ import {
  * open() to attachSession(), once the host is mounted.
  */
 
-const WS_URL = import.meta.env.VITE_PTY_URL ?? "ws://localhost:5174";
+const WS_URL = import.meta.env.VITE_PTY_URL ?? (
+  typeof window !== "undefined" && window.location.hostname !== "localhost" && window.location.hostname !== "127.0.0.1"
+    ? `${window.location.protocol === "https:" ? "wss:" : "ws:"}//${window.location.hostname}/ws`
+    : "ws://localhost:5174"
+);
 
 export interface Session {
   el: HTMLDivElement;

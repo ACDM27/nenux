@@ -1,0 +1,86 @@
+import assert from "node:assert/strict";
+import test from "node:test";
+import fs from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
+import { execFile } from "node:child_process";
+import { promisify } from "node:util";
+import { DatabaseSync } from "node:sqlite";
+import { createServer } from "node:http";
+import { once } from "node:events";
+import { ImService, migrateImSchema } from "./imService.js";
+import { HandoffService } from "./imHandoff.js";
+import { ImTaskService } from "./imTasks.js";
+import { createImHttpHandler } from "./imRoutes.js";
+
+test("handoff snapshots contain bounded Git state, real LLM summaries and explicit fallback mode", async t => {
+  const directory = await fs.mkdtemp(path.join(os.tmpdir(), "termany-handoff-state-"));
+  const exec = promisify(execFile);
+  const git = (args: string[]) => exec("git", ["-C", directory, ...args], { windowsHide: true });
+  await git(["init", "-q"]);
+  await fs.writeFile(path.join(directory, "app.ts"), "export const value = 1;\n");
+  await fs.writeFile(path.join(directory, ".env.local"), "API_KEY=original\n");
+  await git(["add", "."]);
+  await git(["-c", "user.name=Acceptance", "-c", "user.email=acceptance@example.invalid", "commit", "-qm", "baseline"]);
+  await fs.writeFile(path.join(directory, "app.ts"), "export const value = 2;\nconst password = 'do-not-export';\n");
+  await fs.writeFile(path.join(directory, ".env.local"), "API_KEY=never-export\n");
+  const db = new DatabaseSync(":memory:"); migrateImSchema(db);
+  t.after(async () => { db.close(); await fs.rm(directory, { recursive: true, force: true }); });
+  const im = new ImService(db);
+  const conversation = im.createDm({ userId: "a", targetId: "b", targetType: "user" });
+  im.sendMessage(conversation.id, { senderId: "a", senderType: "user", role: "user", content: "Next step: finish acceptance" });
+  const summary = { decisions: [{ decision: "Keep existing services", rationale: "Reuse", madeAtSeq: 1 }], currentState: "In progress", nextSteps: ["Verify"], contextNotes: ["Local"] };
+  const service = new HandoffService(db, im, async () => JSON.stringify(summary));
+  const snapshot = await service.prepareHandoffAsync(conversation.id, "a", "target", { mode: "llm", projectPath: directory });
+  assert.equal(snapshot.distillMode, "llm");
+  assert.deepEqual(snapshot.summary, summary);
+  assert.ok(snapshot.source.gitBranch);
+  assert.deepEqual(snapshot.fileState.modifiedFiles, ["app.ts"]);
+  assert.match(snapshot.fileState.uncommittedDiff!, /value = 2/);
+  assert.doesNotMatch(snapshot.fileState.uncommittedDiff!, /do-not-export|never-export/);
+  assert.equal((db.prepare("SELECT COUNT(*) AS n FROM im_handoff").get() as any).n, 0);
+  service.executeHandoff(snapshot);
+  assert.equal((db.prepare("SELECT distill_mode FROM im_handoff").get() as any).distill_mode, "llm");
+  const invalid = new HandoffService(db, im, async () => "not JSON");
+  const fallback = await invalid.prepareHandoffAsync(conversation.id, "a", "target", { mode: "llm" });
+  assert.equal(fallback.requestedMode, "llm");
+  assert.equal(fallback.distillMode, "rules");
+  assert.match(invalid.renderPreview(fallback), /回退/);
+});
+
+test("HTTP preview launches the reviewed snapshot exactly once and exposes actual target task status", async t => {
+  const db = new DatabaseSync(":memory:"); migrateImSchema(db);
+  const im = new ImService(db); const handoff = new HandoffService(db, im);
+  const source = im.createDm({ userId: "a", targetId: "b", targetType: "user" });
+  im.sendMessage(source.id, { senderId: "a", senderType: "user", role: "user", content: "Next step: implement reviewed result" });
+  const tasks = new ImTaskService(db, im, { defaultCwd: process.cwd(), execute: async ({ task, message }) => {
+    assert.match(message.content, /implement reviewed result/);
+    assert.doesNotMatch(message.content, /FORGED/);
+    return im.sendMessage(task.conversationId, { senderId: "target", senderType: "agent", role: "assistant", content: "Completed target task" }).id;
+  } });
+  im.onMessagePersisted = message => { const task = tasks.enqueue(message); if (task && message.metadata.handoffSnapshotId) handoff.linkTask(message.metadata.handoffSnapshotId, task.id, message.conversationId); };
+  const server = createServer(createImHttpHandler({ imService: im, handoffService: handoff, tasks,
+    agents: () => [{ id: "target", name: "Target", enabled: true }],
+    readJson: async req => { let data = ""; for await (const chunk of req) data += chunk; return JSON.parse(data || "{}"); } }));
+  server.listen(0, "127.0.0.1"); await once(server, "listening");
+  t.after(async () => { tasks.stop(); await new Promise<void>(resolve => server.close(() => resolve())); db.close(); });
+  const base = `http://127.0.0.1:${(server.address() as { port: number }).port}/api/im/handoffs`;
+  const post = (suffix: string, body: unknown) => fetch(base + suffix, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+  const body = { userId: "a", conversationId: source.id, sourceAgentId: "a", targetAgent: "target", projectPath: "" };
+  const previewResponse = await post("/preview", body);
+  assert.equal(previewResponse.status, 200);
+  const preview = ((await previewResponse.json()) as any).data;
+  assert.equal(tasks.list(source.id).length, 0);
+  const execute = { ...body, previewId: preview.previewId, handoffNote: "FORGED" };
+  const response = await post("", execute); assert.equal(response.status, 200);
+  const result = ((await response.json()) as any).data;
+  assert.ok(result.taskId); assert.notEqual(result.targetConversationId, source.id);
+  const duplicate = ((await (await post("", execute)).json()) as any).data;
+  assert.equal(duplicate.taskId, result.taskId);
+  assert.equal(tasks.list(result.targetConversationId).length, 1);
+  for (let index = 0; index < 100 && tasks.get(result.taskId)?.status !== "succeeded"; index++) await new Promise(resolve => setTimeout(resolve, 10));
+  const records = ((await (await fetch(`${base}?conversation_id=${source.id}&user_id=a`)).json()) as any).data;
+  assert.equal(records[0].status, "succeeded");
+  assert.equal((await post("", { ...execute, userId: "b" })).status, 400);
+  assert.equal((await post("/preview", { ...body, userId: "outsider" })).status, 403);
+});

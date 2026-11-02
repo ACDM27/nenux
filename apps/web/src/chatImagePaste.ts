@@ -1,5 +1,6 @@
 import { apiPath } from "./api";
 import type { AgentImageAttachment } from "./state/store";
+import { uuid } from "./uuid";
 
 const IMAGE_MIMES = new Set(["image/gif", "image/jpeg", "image/png", "image/webp"]);
 const MAX_IMAGE_BYTES = 20_000_000;
@@ -33,5 +34,5 @@ export async function uploadChatImage(file: File, signal?: AbortSignal,
   });
   const payload = await response.json().catch(() => ({})) as { path?: string; error?: string };
   if (!response.ok || !payload.path) throw new Error(payload.error || `upload failed (${response.status})`);
-  return { id: crypto.randomUUID(), kind: "image", path: payload.path, mimeType };
+  return { id: uuid(), kind: "image", path: payload.path, mimeType };
 }

@@ -3,6 +3,7 @@ import { demoState, isDemo } from "../demo";
 import { layoutHasPage, mergeLayout } from "./layoutMerge";
 import { activePageId, useStore, type AgentConversation, type UserProfile, type Workspace } from "./store";
 import { onTakenPagesChange, readWindowPref, takenPages, writeWindowPref } from "./windows";
+import { uuid } from "../uuid";
 
 /**
  * True once the server has answered a state load. Saves are gated on this:
@@ -16,7 +17,7 @@ let hydrated = false;
  * the echo of its own writes. Per webview, not per user — a second window is a
  * different client even though both speak for the same person.
  */
-const clientId = crypto.randomUUID();
+const clientId = uuid();
 
 /**
  * Set while a snapshot from another window is being written into the store, so

@@ -1,6 +1,7 @@
 import { textInputProps } from "../textInputProps";
 import { Fragment, useCallback, useEffect, useId, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
+import { uuid } from "../uuid";
 import type { BotIdentity } from "@termany/core";
 import { agentCommand, useAgentConfigs } from "../agents";
 import { needsInteractiveAgentLogin } from "../agentAuthentication";
@@ -83,7 +84,7 @@ interface PendingPermission {
 
 
 function message(role: AgentMessage["role"], content: string): AgentMessage {
-  return { id: crypto.randomUUID(), role, content, createdAt: Date.now() };
+  return { id: uuid(), role, content, createdAt: Date.now() };
 }
 
 async function streamGreeting(

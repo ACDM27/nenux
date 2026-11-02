@@ -77,13 +77,14 @@ test("removing a section takes its body and nothing after it", () => {
 const HOME = await fs.mkdtemp(path.join(os.tmpdir(), "termany-providers-"));
 const realHomedir = os.homedir;
 (os as { homedir: () => string }).homedir = () => HOME;
-await import("./db.js");
+const testDb = await import("./db.js");
 const providers = await import("./agentProviders/index.js");
 const store = await import("./agentProviders/store.js");
 
 test.after(async () => {
   (os as { homedir: () => string }).homedir = realHomedir;
-  await fs.rm(HOME, { recursive: true, force: true });
+  testDb.getDb().close();
+  await fs.rm(HOME, { recursive: true, force: true, maxRetries: 20, retryDelay: 100 });
 });
 
 /** Empty store, empty agent config trees — the state a test starts from. */

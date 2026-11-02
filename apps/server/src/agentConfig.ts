@@ -4,17 +4,7 @@ import { getAgentsRaw, setAgentsRaw } from "./db.js";
 export type AgentDistribution = "managed" | "system" | "custom";
 export type AgentModelSource = "termany" | "agent";
 
-export type AgentRuntimeConfig = {
-  protocol: "acp";
-  command: string;
-  args: string;
-  distribution: AgentDistribution;
-  modelSource: AgentModelSource;
-} | {
-  protocol: "acp-http";
-  endpoint: string;
-  apiKey: string;
-};
+export type AgentRuntimeConfig = import("@termany/core").AgentRuntimeConfig;
 
 export interface AgentConfig {
   id: string;
@@ -102,6 +92,10 @@ function isRemovedDefault(input: any): boolean {
 
 function runtime(input: any): AgentRuntimeConfig | undefined {
   if (!input) return undefined;
+  if (input.protocol === "chatgpt-oauth") {
+    const model = String(input.model ?? "").trim();
+    return model ? { protocol: "chatgpt-oauth", model } : undefined;
+  }
   if (input.protocol === "acp-http") {
     const endpoint = String(input.endpoint ?? "").trim().replace(/\/+$/, "");
     if (!/^https?:\/\//i.test(endpoint)) return undefined;

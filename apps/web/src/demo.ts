@@ -1,5 +1,6 @@
 import type { ITerminalBackend } from "@termany/core";
 import type { HTab, Pane, TreeNode, Workspace } from "./state/store";
+import { uuid } from "./uuid";
 
 /**
  * Demo mode — a browser-only build of the web app for the marketing site
@@ -387,7 +388,7 @@ export class DemoBackend implements ITerminalBackend {
 
 // --- curated demo layout -----------------------------------------------------
 
-const uid = () => crypto.randomUUID();
+const uid = () => uuid();
 
 function leaf(title: string): Extract<Pane, { kind: "leaf" }> {
   const l: Extract<Pane, { kind: "leaf" }> = { kind: "leaf", id: uid(), title };

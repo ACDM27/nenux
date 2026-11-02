@@ -3,6 +3,7 @@
  */
 import { useState, useRef, useEffect } from "react";
 import { apiPath } from "../api";
+import { uuid } from "../uuid";
 import { Markdown } from "./Markdown";
 
 interface Message {
@@ -49,7 +50,7 @@ export function CodexConversation() {
     if (!input.trim() || loading) return;
 
     const userMessage: Message = {
-      id: crypto.randomUUID(),
+      id: uuid(),
       role: "user",
       content: input.trim(),
       createdAt: Date.now(),
@@ -61,7 +62,7 @@ export function CodexConversation() {
     setError(null);
 
     const assistantMessage: Message = {
-      id: crypto.randomUUID(),
+      id: uuid(),
       role: "assistant",
       content: "",
       createdAt: Date.now(),

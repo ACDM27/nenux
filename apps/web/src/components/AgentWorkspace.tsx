@@ -28,10 +28,9 @@ import { useI18n } from "../i18n";
 import { useImeGuard } from "../imeGuard";
 import { fetchConfiguredDefaultModel } from "../modelConfig";
 import { useNativeOccluder } from "../nativeViewOcclusion";
-import { apiPath } from "../api";
 import { useStore, type AgentConversation } from "../state/store";
 import { useTerminalTranscriptSync } from "../useTerminalTranscriptSync";
-import { useImBridge } from "../imAdapter";
+// IM bridge disabled — IM is managed independently by Inbox + imStore
 import { AgentPane } from "./AgentPane";
 import { AgentLauncher } from "./AgentLauncher";
 import { AgentGroupDialog } from "./AgentGroupDialog";
@@ -126,8 +125,8 @@ export function AgentWorkspace({ workspaceId, visible = true }: { workspaceId: s
   const { sessions: terminalSessions } = useTerminalTranscriptSync();
   const firstWorkspaceId = useStore((s) => s.workspaces[0]?.id ?? "");
 
-  // ─── IM 桥接：从 IM API 同步会话/消息到 store ─────────
-  const imBridge = useImBridge();
+  // ─── IM 桥接已禁用：IM 会话由 Inbox + imStore 独立管理 ─────
+  // const imBridge = useImBridge();
 
   const conversations = useMemo(
     () =>
@@ -522,12 +521,7 @@ export function AgentWorkspace({ workspaceId, visible = true }: { workspaceId: s
     setActiveId(conversations[0]?.id ?? "");
   }, [activeId, conversations]);
 
-  // ─── 切换会话时从 IM API 加载消息 ─────────────────────
-  useEffect(() => {
-    if (activeId) {
-      imBridge.syncMessages(activeId);
-    }
-  }, [activeId, imBridge]);
+  // ─── IM 消息加载已禁用（由 Inbox 独立管理）─────────────
 
   useEffect(() => {
     const timer = window.setInterval(() => setNow(Date.now()), 60_000);
@@ -602,7 +596,6 @@ export function AgentWorkspace({ workspaceId, visible = true }: { workspaceId: s
     conversations.forEach((conversation) => {
       if (unreadAgentMessages(conversation) > 0) {
         markRead(conversation.id);
-        imBridge.markReadSync(conversation.id);
       }
     });
     setFilterOpen(false);
@@ -613,7 +606,6 @@ export function AgentWorkspace({ workspaceId, visible = true }: { workspaceId: s
       if (visible && active && !isConversationStreaming(active.id) && unreadAgentMessages(active) &&
         document.visibilityState === "visible" && document.hasFocus()) {
         markRead(active.id);
-        imBridge.markReadSync(active.id);
       }
     };
     read();
@@ -623,7 +615,7 @@ export function AgentWorkspace({ workspaceId, visible = true }: { workspaceId: s
       window.removeEventListener("focus", read);
       document.removeEventListener("visibilitychange", read);
     };
-  }, [active, markRead, streamingIds, visible, imBridge]);
+  }, [active, markRead, streamingIds, visible]);
   // "" is an explicit pick of Termany's own assistant; undefined predates the
   // picker and still follows the first configured runtime.
   const runtimeIcon = (id: string | undefined) =>

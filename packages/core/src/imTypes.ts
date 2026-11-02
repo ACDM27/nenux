@@ -83,6 +83,9 @@ export interface ImMessage {
 }
 
 export interface MessageMetadata {
+  attachments?: ImAttachment[];
+  handoffSnapshotId?: string;
+  handoffExecution?: import("./imTasks.js").ImExecutionSettings;
   /** 文件附件信息 */
   file?: { name: string; size: number; url: string; mimeType?: string };
   /** 图片信息 */
@@ -95,6 +98,14 @@ export interface MessageMetadata {
   replyGroupId?: string;
   /** 侧链 ID */
   sidechainId?: string;
+}
+
+export interface ImAttachment {
+  id: string;
+  conversationId: string;
+  name: string;
+  size: number;
+  mimeType: string;
 }
 
 export interface SendMessageRequest {

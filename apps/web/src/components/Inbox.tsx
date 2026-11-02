@@ -19,6 +19,7 @@ import { useImWebSocket } from "../useImWebSocket";
 import { imApi, type ImConversation, type ImMessage } from "../imClient";
 import { SearchIcon, SendIcon, CloseIcon } from "./icons";
 import { useStore } from "../state/store";
+import { apiPath } from "../api";
 
 // ─── 常量 ──────────────────────────────────────────────
 
@@ -40,15 +41,40 @@ export function Inbox({ serverPort = 5175 }: InboxProps) {
     conversations, activeConversationId, messages,
     unreadCounts, searchResults, searchQuery, typingUsers,
     wsConnected, conversationsLoading, messagesLoading,
+    userId,
     loadConversations, setActiveConversation, loadMoreMessages,
     sendMessage, editMessage, deleteMessage,
-    markAsRead, loadUnreadCounts,
+    loadUnreadCounts,
     search, clearSearch,
     addReaction, removeReaction,
     setUserId,
   } = useImStore();
 
   const { subscribe, unsubscribe, sendTyping } = useImWebSocket(serverPort);
+
+  // 当前会话是否群组
+  const isGroupChat = conversations.find(c => c.id === activeConversationId)?.type === "group";
+
+  // 侧栏 Tab
+  const [sidebarTab, setSidebarTab] = useState<"chats" | "contacts" | "groups">("chats");
+
+  // 从会话中提取所有已知用户
+  const knownUsers = useMemo(() => {
+    const userSet = new Set<string>();
+    conversations.forEach(_conv => {
+      // 从成员列表中提取（需要 imStore 提供成员信息）
+    });
+    // 至少包含当前用户
+    userSet.add(userId);
+    // 添加种子用户
+    ["alice", "bob", "charlie", "diana", "eve"].forEach(u => userSet.add(u));
+    return Array.from(userSet).filter(u => u !== userId).sort();
+  }, [conversations, userId]);
+
+  // 群组列表
+  const groupConversations = useMemo(() => {
+    return conversations.filter(c => c.type === "group");
+  }, [conversations]);
 
   // 从主 store 同步 userId（不再硬编码 "default-user"）
   const userNickname = useStore((s) => s.userProfile.nickname);
@@ -93,7 +119,6 @@ export function Inbox({ serverPort = 5175 }: InboxProps) {
     const el = messagesContainerRef.current;
     if (!el || messages.length === 0) return;
     const { scrollTop, clientHeight } = el;
-    const totalHeight = messages.length * ESTIMATED_MSG_HEIGHT;
 
     // 计算可视区域
     const startIdx = Math.max(0, Math.floor(scrollTop / ESTIMATED_MSG_HEIGHT) - OVERSCAN);
@@ -220,10 +245,32 @@ export function Inbox({ serverPort = 5175 }: InboxProps) {
           </div>
         </div>
 
+        {/* ─── 侧栏 Tab 切换 ─── */}
+        <div className="im-sidebar-tabs">
+          <button
+            className={`im-sidebar-tab${sidebarTab === "chats" ? " active" : ""}`}
+            onClick={() => setSidebarTab("chats")}
+          >
+            💬 消息
+          </button>
+          <button
+            className={`im-sidebar-tab${sidebarTab === "contacts" ? " active" : ""}`}
+            onClick={() => setSidebarTab("contacts")}
+          >
+            👤 通讯录
+          </button>
+          <button
+            className={`im-sidebar-tab${sidebarTab === "groups" ? " active" : ""}`}
+            onClick={() => setSidebarTab("groups")}
+          >
+            👥 群组
+          </button>
+        </div>
+
         <div className="im-search">
           <SearchIcon />
           <input
-            placeholder="搜索消息..."
+            placeholder={sidebarTab === "chats" ? "搜索消息..." : sidebarTab === "contacts" ? "搜索联系人..." : "搜索群组..."}
             value={searchInput}
             onChange={(e) => setSearchInput(e.target.value)}
             onKeyDown={(e) => e.key === "Enter" && handleSearch()}
@@ -234,6 +281,8 @@ export function Inbox({ serverPort = 5175 }: InboxProps) {
           {wsConnected ? "已连接" : "未连接"}
         </div>
 
+        {/* ─── 消息 Tab ─── */}
+        {sidebarTab === "chats" && (
         <div className="im-conversation-list">
           {conversationsLoading && (
             <div className="im-empty-hint">加载中...</div>
@@ -259,6 +308,85 @@ export function Inbox({ serverPort = 5175 }: InboxProps) {
             </div>
           )}
         </div>
+        )}
+
+        {/* ─── 通讯录 Tab ─── */}
+        {sidebarTab === "contacts" && (
+        <div className="im-contacts-list">
+          {knownUsers.length === 0 ? (
+            <div className="im-empty-hint">
+              <p>暂无联系人</p>
+              <p style={{ fontSize: 11, color: "var(--fg-dim)" }}>通过群组会话添加联系人</p>
+            </div>
+          ) : (
+            knownUsers.map((contactId) => (
+              <div
+                key={contactId}
+                className="im-contact-row"
+                onClick={async () => {
+                  // 创建或打开与该用户的 DM
+                  try {
+                    const res = await fetch(apiPath("/api/im/conversations/dm"), {
+                      method: "POST",
+                      headers: { "Content-Type": "application/json" },
+                      body: JSON.stringify({ userId, targetId: contactId }),
+                    });
+                    const json = await res.json() as { ok: boolean; data: { id: string } };
+                    if (json.ok) {
+                      setActiveConversation(json.data.id);
+                      setSidebarTab("chats");
+                    }
+                  } catch (e) {
+                    console.error("[Inbox] create DM failed:", e);
+                  }
+                }}
+              >
+                <div className="im-avatar" style={{ background: avatarColor(contactId), width: 36, height: 36, fontSize: 16 }}>
+                  {avatarInitial(contactId)}
+                </div>
+                <div className="im-contact-info">
+                  <div className="im-contact-name">{contactId}</div>
+                  <div className="im-contact-status">在线</div>
+                </div>
+              </div>
+            ))
+          )}
+        </div>
+        )}
+
+        {/* ─── 群组 Tab ─── */}
+        {sidebarTab === "groups" && (
+        <div className="im-groups-list">
+          <button
+            className="im-new-group-btn"
+            onClick={() => setNewConvOpen(true)}
+          >
+            + 创建群组
+          </button>
+          {groupConversations.length === 0 ? (
+            <div className="im-empty-hint">
+              <p>暂无群组</p>
+            </div>
+          ) : (
+            groupConversations.map((conv) => (
+              <div
+                key={conv.id}
+                className={`im-group-row${conv.id === activeConversationId ? " active" : ""}`}
+                onClick={() => { setActiveConversation(conv.id); setSidebarTab("chats"); }}
+              >
+                <div className="im-group-icon">👥</div>
+                <div className="im-group-info">
+                  <div className="im-group-name">{conv.title || "未命名群组"}</div>
+                  <div className="im-group-members">{conv.memberCount} 成员</div>
+                </div>
+                {unreadCounts.get(conv.id) ? (
+                  <span className="im-group-unread">{unreadCounts.get(conv.id)}</span>
+                ) : null}
+              </div>
+            ))
+          )}
+        </div>
+        )}
       </aside>
 
       {/* ─── 中栏：聊天区 ─── */}
@@ -315,12 +443,17 @@ export function Inbox({ serverPort = 5175 }: InboxProps) {
               {visibleMessages.map((msg, idx) => {
                 const globalIdx = visibleRange.start + idx;
                 const showDateSep = shouldShowDateSep(messages, globalIdx);
+                const prevMsg = globalIdx > 0 ? messages[globalIdx - 1] : null;
+                const showSenderInfo = !prevMsg || prevMsg.senderId !== msg.senderId
+                  || (msg.createdAt - prevMsg.createdAt > 60000);
                 return (
                   <div key={msg.id}>
                     {showDateSep && <DateSeparator timestamp={msg.createdAt} />}
                     <MessageBubble
                       msg={msg}
-                      isOwn={msg.senderType === "user"}
+                      isOwn={msg.senderId === userId}
+                      showSender={showSenderInfo}
+                      isGroupChat={isGroupChat}
                       isEditing={editingId === msg.id}
                       editContent={editContent}
                       onEditContentChange={setEditContent}
@@ -538,9 +671,22 @@ function ConversationRow({ conv, isActive, unread, onClick }: {
 
 // ─── 消息气泡 ───────────────────────────────────────────
 
-function MessageBubble({ msg, isOwn, isEditing, editContent, onEditContentChange, onStartEdit, onCancelEdit, onConfirmEdit, onDelete, onReaction, onRemoveReaction, highlighted }: {
+/** 用户头像颜色池 */
+const AVATAR_COLORS = ["#4A90D9", "#E74C3C", "#2ECC71", "#F39C12", "#9B59B6", "#1ABC9C", "#E67E22", "#3498DB"];
+function avatarColor(id: string) {
+  let hash = 0;
+  for (let i = 0; i < id.length; i++) hash = ((hash << 5) - hash + id.charCodeAt(i)) | 0;
+  return AVATAR_COLORS[Math.abs(hash) % AVATAR_COLORS.length];
+}
+function avatarInitial(id: string) {
+  return id.charAt(0).toUpperCase();
+}
+
+function MessageBubble({ msg, isOwn, showSender, isGroupChat: _isGroupChat, isEditing, editContent, onEditContentChange, onStartEdit, onCancelEdit, onConfirmEdit, onDelete, onReaction, onRemoveReaction, highlighted }: {
   msg: ImMessage;
   isOwn: boolean;
+  showSender: boolean;
+  isGroupChat: boolean;
   isEditing: boolean;
   editContent: string;
   onEditContentChange: (v: string) => void;
@@ -582,39 +728,58 @@ function MessageBubble({ msg, isOwn, isEditing, editContent, onEditContentChange
 
   return (
     <div
-      className={`im-msg-wrapper${isOwn ? " own" : ""}${highlighted ? " highlighted" : ""}`}
+      className={`im-msg-row${isOwn ? " own" : ""}${highlighted ? " highlighted" : ""}`}
       data-msg-id={msg.id}
       onMouseEnter={() => setShowActions(true)}
       onMouseLeave={() => setShowActions(false)}
       onContextMenu={handleContextMenu}
     >
-      {msg.senderType === "agent" && (
-        <div className="im-msg-sender">🤖 {msg.senderId}</div>
+      {/* 头像区 */}
+      {!isOwn && (
+        <div className="im-avatar-col">
+          {showSender && (
+            <div className="im-avatar" style={{ background: avatarColor(msg.senderId) }}>
+              {avatarInitial(msg.senderId)}
+            </div>
+          )}
+        </div>
       )}
 
-      <div className={`im-bubble${isOwn ? " own" : ""}`}>
-        {isEditing ? (
-          <div className="im-edit-box">
-            <input
-              value={editContent}
-              onChange={(e) => onEditContentChange(e.target.value)}
-              onKeyDown={(e) => {
-                if (e.key === "Enter") onConfirmEdit();
-                if (e.key === "Escape") onCancelEdit();
-              }}
-              autoFocus
-            />
-            <div className="im-edit-actions">
-              <button onClick={onConfirmEdit}>保存</button>
-              <button onClick={onCancelEdit}>取消</button>
-            </div>
-          </div>
-        ) : (
-          <div className="im-bubble-content">
-            <span className="im-bubble-text">{msg.content}</span>
-            {msg.editedAt && <span className="im-bubble-edited">(已编辑)</span>}
+      {/* 消息内容区 */}
+      <div className="im-msg-body">
+        {showSender && !isOwn && (
+          <div className="im-msg-sender" style={{ color: avatarColor(msg.senderId) }}>
+            {msg.senderId}
+            <span className="im-msg-time">{formatTime(msg.createdAt)}</span>
           </div>
         )}
+        {showSender && isOwn && (
+          <div className="im-msg-time-own">{formatTime(msg.createdAt)}</div>
+        )}
+
+        <div className={`im-bubble${isOwn ? " own" : ""}`}>
+          {isEditing ? (
+            <div className="im-edit-box">
+              <input
+                value={editContent}
+                onChange={(e) => onEditContentChange(e.target.value)}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter") onConfirmEdit();
+                  if (e.key === "Escape") onCancelEdit();
+                }}
+                autoFocus
+              />
+              <div className="im-edit-actions">
+                <button onClick={onConfirmEdit}>保存</button>
+                <button onClick={onCancelEdit}>取消</button>
+              </div>
+            </div>
+          ) : (
+            <div className="im-bubble-content">
+              <MessageContent content={msg.content} />
+              {msg.editedAt && <span className="im-bubble-edited">(已编辑)</span>}
+            </div>
+          )}
 
         {msg.reactions && msg.reactions.length > 0 && (
           <div className="im-reactions">
@@ -634,15 +799,24 @@ function MessageBubble({ msg, isOwn, isEditing, editContent, onEditContentChange
         )}
       </div>
 
+      {/* 飞书风格浮动操作栏 */}
       {showActions && !isEditing && (
-        <div className="im-msg-actions">
-          <button onClick={() => onReaction("👍")} title="点赞">👍</button>
-          <button onClick={() => onReaction("❤️")} title="爱心">❤️</button>
-          <button onClick={handleCopy} title="复制">📋</button>
+        <div className={`im-action-bar${isOwn ? " own" : ""}`}>
+          <button className="im-action-btn" onClick={() => onReaction("👍")} title="点赞">👍</button>
+          <button className="im-action-btn" onClick={() => onReaction("❤️")} title="爱心">❤️</button>
+          <button className="im-action-btn" onClick={() => onReaction("😂")} title="笑哭">😂</button>
+          <div className="im-action-divider" />
+          <button className="im-action-btn" onClick={handleCopy} title="复制">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1"/></svg>
+          </button>
           {isOwn && (
             <>
-              <button onClick={onStartEdit} title="编辑">✏️</button>
-              <button onClick={onDelete} title="撤回">🗑️</button>
+              <button className="im-action-btn" onClick={onStartEdit} title="编辑">
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M11 4H4a2 2 0 00-2 2v14a2 2 0 002 2h14a2 2 0 002-2v-7"/><path d="M18.5 2.5a2.121 2.121 0 013 3L12 15l-4 1 1-4 9.5-9.5z"/></svg>
+              </button>
+              <button className="im-action-btn im-action-danger" onClick={onDelete} title="撤回">
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M3 6h18"/><path d="M19 6v14a2 2 0 01-2 2H7a2 2 0 01-2-2V6m3 0V4a2 2 0 012-2h4a2 2 0 012 2v2"/></svg>
+              </button>
             </>
           )}
         </div>
@@ -668,10 +842,10 @@ function MessageBubble({ msg, isOwn, isEditing, editContent, onEditContentChange
       )}
 
       <div className="im-msg-meta">
-        {formatTime(msg.createdAt)}
         {msg.replyGroupId && <span title="气泡组"> 🔗</span>}
         {msg.sidechainId && <span title="侧链"> 🔀</span>}
       </div>
+      </div>{/* end im-msg-body */}
     </div>
   );
 }
@@ -724,4 +898,98 @@ function groupByEmoji(reactions: Array<{ emoji: string }>): Array<{ emoji: strin
   const map = new Map<string, number>();
   for (const r of reactions) map.set(r.emoji, (map.get(r.emoji) ?? 0) + 1);
   return Array.from(map, ([emoji, count]) => ({ emoji, count }));
+}
+
+// ─── 消息内容渲染器（@提及 + 链接 + 代码块） ──────────────
+
+// URL 域名提取（暂未使用）
+// function urlDomain(url: string): string {
+//   try { return new URL(url).hostname.replace(/^www\./, ""); } catch { return url; }
+// }
+
+/** 消息内容解析：@提及高亮 + URL 链接 + 行内代码 */
+function MessageContent({ content }: { content: string }) {
+  // 检测是否含代码块
+  const hasCodeBlock = /```[\s\S]*?```/.test(content);
+
+  if (hasCodeBlock) {
+    // 代码块 + 普通文本混合渲染
+    const parts = content.split(/(```[\s\S]*?```)/g);
+    return (
+      <div className="im-msg-content">
+        {parts.map((part, i) => {
+          if (part.startsWith("```") && part.endsWith("```")) {
+            const inner = part.slice(3, -3);
+            const firstLine = inner.indexOf("\n");
+            const lang = firstLine > 0 ? inner.slice(0, firstLine).trim() : "";
+            const code = firstLine > 0 ? inner.slice(firstLine + 1) : inner;
+            return (
+              <pre key={i} className="im-code-block">
+                {lang && <div className="im-code-lang">{lang}</div>}
+                <code>{code}</code>
+              </pre>
+            );
+          }
+          return <InlineContent key={i} text={part} />;
+        })}
+      </div>
+    );
+  }
+
+  return (
+    <div className="im-msg-content">
+      <InlineContent text={content} />
+    </div>
+  );
+}
+
+/** 行内内容：@提及 + URL + 行内代码 */
+function InlineContent({ text }: { text: string }) {
+  // 匹配 @用户名、URL、`行内代码`
+  const regex = /(@\w+)|(https?:\/\/[^\s<]+)|(`[^`]+`)/g;
+  const parts: Array<{ type: "text" | "mention" | "url" | "code"; value: string }> = [];
+  let lastIdx = 0;
+  let match;
+
+  while ((match = regex.exec(text)) !== null) {
+    if (match.index > lastIdx) {
+      parts.push({ type: "text", value: text.slice(lastIdx, match.index) });
+    }
+    if (match[1]) parts.push({ type: "mention", value: match[1] });
+    else if (match[2]) parts.push({ type: "url", value: match[2] });
+    else if (match[3]) parts.push({ type: "code", value: match[3] });
+    lastIdx = match.index + match[0].length;
+  }
+  if (lastIdx < text.length) {
+    parts.push({ type: "text", value: text.slice(lastIdx) });
+  }
+
+  return (
+    <>
+      {parts.map((part, i) => {
+        switch (part.type) {
+          case "mention":
+            return (
+              <span key={i} className="im-mention">
+                {part.value}
+              </span>
+            );
+          case "url":
+            return (
+              <a key={i} className="im-link" href={part.value} target="_blank" rel="noopener noreferrer">
+                {part.value}
+              </a>
+            );
+          case "code":
+            return (
+              <code key={i} className="im-inline-code">
+                {part.value.slice(1, -1)}
+              </code>
+            );
+          default:
+            return <span key={i} className="im-bubble-text">{part.value}</span>;
+        }
+      })}
+    </>
+  );
 }

@@ -7,6 +7,12 @@ import test from "node:test";
 import { defaultAgentRuntime } from "@termany/core";
 import { detectAgentExecutable, parseAgentDetectionInput } from "./agentDetection.js";
 
+test("detection accepts absent runtime and preserves OAuth runtime configuration", () => {
+  assert.equal(parseAgentDetectionInput({ id: "custom", command: "node" })?.runtime, undefined);
+  assert.deepEqual(parseAgentDetectionInput({ id: "oauth", runtime: { protocol: "chatgpt-oauth", model: "test-model" } })?.runtime,
+    { protocol: "chatgpt-oauth", model: "test-model" });
+});
+
 test("managed Claude and Codex runtimes require their user-installed CLI", async (t) => {
   const directory = await fs.mkdtemp(path.join(os.tmpdir(), "termany-managed-detect-"));
   t.after(() => fs.rm(directory, { recursive: true, force: true }));
@@ -20,7 +26,7 @@ test("managed Claude and Codex runtimes require their user-installed CLI", async
       args: "",
       enabled: true,
       builtIn: true,
-      runtime: defaultAgentRuntime(id),
+      runtime: { protocol: "acp", distribution: "managed", modelSource: "agent", command: `${id}-agent-acp`, args: "" },
     });
     assert.equal(result.installed, true);
     assert.equal(result.terminalInstalled, true);

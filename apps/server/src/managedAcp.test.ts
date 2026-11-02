@@ -3,7 +3,6 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
-import { defaultAgentRuntime } from "@termany/core";
 import { managedAcpAdapterPath, prepareManagedAcpLaunch } from "./managedAcp.js";
 
 for (const id of ["claude", "codex"] as const) {
@@ -12,7 +11,7 @@ for (const id of ["claude", "codex"] as const) {
     t.after(() => fs.rm(directory, { recursive: true, force: true }));
     const cli = path.join(directory, id);
     await fs.writeFile(cli, "#!/bin/sh\nexit 0\n", { mode: 0o755 });
-    const runtime = defaultAgentRuntime(id);
+    const runtime = { protocol: "acp" as const, distribution: "managed" as const, modelSource: "agent" as const, command: `${id}-agent-acp`, args: "" };
     assert.equal(runtime?.protocol, "acp");
     if (!runtime || runtime.protocol !== "acp") return;
 

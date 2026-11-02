@@ -1,4 +1,5 @@
 import type { Language } from "./i18n";
+import { uuid } from "./uuid";
 
 export interface GreetingBotProfile {
   id?: string;
@@ -33,7 +34,7 @@ export function agentGreetingPrompt({
   language,
   now = new Date(),
   timeZone = Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC",
-  variation = crypto.randomUUID(),
+  variation = uuid(),
 }: AgentGreetingContext): string {
   const localDateTime = new Intl.DateTimeFormat(language, {
     dateStyle: "full",

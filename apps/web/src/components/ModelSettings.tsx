@@ -2,6 +2,7 @@ import { textInputProps } from "../textInputProps";
 import { useEffect, useState } from "react";
 import { apiPath } from "../api";
 import { useI18n } from "../i18n";
+import { uuid } from "../uuid";
 import { CheckIcon, CloseIcon, EditIcon, FlaskIcon, PlusIcon, SpinnerIcon } from "./icons";
 
 /** The wire format Termany speaks to this provider — also the stored kind. */
@@ -60,7 +61,7 @@ const DEFAULT_BASE: Record<Kind, string> = {
   openai: "https://api.openai.com/v1",
 };
 
-const newId = () => crypto.randomUUID();
+const newId = () => uuid();
 
 /** Mirrors the server's joinUrl so the dialog can preview the tested endpoint. */
 function testEndpoint(apiBase: string, kind: Kind): string {

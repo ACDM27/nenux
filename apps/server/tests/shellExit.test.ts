@@ -16,6 +16,7 @@ import os from "node:os";
 import path from "node:path";
 import { after, before, test } from "node:test";
 import { fileURLToPath } from "node:url";
+import { once } from "node:events";
 
 const SHELL_EXIT_CLOSE_CODE = 4000;
 // Offset by pid so concurrent runs (or a leftover server from a killed run)
@@ -34,12 +35,15 @@ before(async () => {
     env: {
       ...process.env,
       HOME: home,
+      USERPROFILE: home,
+      TERMANY_DATA_DIR: path.join(home, ".termany"),
       TERMANY_PORT: String(PORT),
       // bash rather than the developer's own shell: the assertions below depend
       // on POSIX `exit`/EOF status semantics, not on someone's zsh config.
-      TERMANY_SHELL: "/bin/bash",
+      TERMANY_SHELL: process.platform === "win32" ? path.join(process.env.SystemRoot || "C:\\Windows", "System32", "WindowsPowerShell", "v1.0", "powershell.exe") : "/bin/bash",
     },
     stdio: "ignore",
+    windowsHide: true,
   });
   for (let i = 0; i < 100; i++) {
     try {
@@ -52,9 +56,9 @@ before(async () => {
   throw new Error(`server did not start on port ${PORT}`);
 });
 
-after(() => {
-  server?.kill("SIGKILL");
-  if (home) fs.rmSync(home, { recursive: true, force: true });
+after(async () => {
+  if (server?.exitCode === null) { server.kill("SIGKILL"); await once(server, "exit"); }
+  if (home) fs.rmSync(home, { recursive: true, force: true, maxRetries: 20, retryDelay: 100 });
 });
 
 /**
@@ -84,14 +88,14 @@ async function exitStatusOf(session: string, command: string): Promise<unknown> 
   return JSON.parse(reason);
 }
 
-test("a deliberate exit reports a clean status", async () => {
+test("a deliberate exit reports a clean status", { skip: process.platform === "win32" }, async () => {
   assert.deepEqual(await exitStatusOf("test-clean-exit", "true\nexit\n"), {
     exitCode: 0,
     signal: 0,
   });
 });
 
-test("EOF after a failed command reports that command's status", async () => {
+test("EOF after a failed command reports that command's status", { skip: process.platform === "win32" }, async () => {
   // Ctrl+D is still the user asking to close the pane, but bash hands back the
   // last command's status — so the frontend must NOT read a non-zero code here
   // as "crashed". Locking the behaviour in: this is the case that makes an
@@ -102,7 +106,7 @@ test("EOF after a failed command reports that command's status", async () => {
   });
 });
 
-test("a signalled kill is distinguishable from a clean exit", async () => {
+test("a signalled kill is distinguishable from a clean exit", { skip: process.platform === "win32" }, async () => {
   // The exit code alone is 0 here — identical to a graceful `exit`. Only the
   // signal separates "the OS killed my shell" from "the user closed the pane",
   // which is why it has to survive the trip to the frontend.
@@ -110,4 +114,9 @@ test("a signalled kill is distinguishable from a clean exit", async () => {
     exitCode: 0,
     signal: 9,
   });
+});
+
+test("PowerShell natural exits preserve clean and nonzero status on Windows", { skip: process.platform !== "win32", timeout: 30_000 }, async () => {
+  assert.deepEqual(await exitStatusOf("test-windows-clean", "exit 0\r"), { exitCode: 0, signal: 0 });
+  assert.deepEqual(await exitStatusOf("test-windows-status", "exit 7\r"), { exitCode: 7, signal: 0 });
 });

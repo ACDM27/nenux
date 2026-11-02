@@ -3,6 +3,7 @@ import { useEffect, useId, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import { apiPath } from "../api";
 import { useI18n } from "../i18n";
+import { uuid } from "../uuid";
 import { registerOccluder, unregisterOccluder } from "../nativeViewOcclusion";
 import { EditIcon, PlusIcon, SshIcon, SpinnerIcon, TrashIcon } from "./icons";
 
@@ -18,7 +19,7 @@ export interface SshProfile {
 
 type AuthMethod = NonNullable<SshProfile["authMethod"]>;
 type TestStatus = "connected" | "passwordRequired" | "hostKey" | "timeout" | "failed";
-const blank = (): SshProfile => ({ id: crypto.randomUUID(), name: "", host: "", authMethod: "default" });
+const blank = (): SshProfile => ({ id: uuid(), name: "", host: "", authMethod: "default" });
 const profileAuthMethod = (profile: SshProfile): AuthMethod =>
   profile.authMethod ?? (profile.identityFile ? "identity" : "default");
 

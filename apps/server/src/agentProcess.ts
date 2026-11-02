@@ -9,7 +9,7 @@ export function stopAgentProcess(child: ChildProcess): void {
   stopped.add(child);
   const pid = child.pid;
   if (process.platform === "win32") {
-    execFile("taskkill", ["/pid", String(pid), "/T", "/F"], (error) => {
+    execFile("taskkill", ["/pid", String(pid), "/T", "/F"], { windowsHide: true }, (error) => {
       if (error) child.kill();
     });
     return;

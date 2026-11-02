@@ -247,6 +247,8 @@ function buildPreview(content: string, messageType: string, metadata?: Partial<M
 // ─── 会话管理 ─────────────────────────────────────────
 
 export class ImService {
+  /** Synchronous transactional extension; must not perform network work. */
+  onMessagePersisted?: (message: ImMessage) => void;
   constructor(private db: DatabaseSync) {}
 
   /** 创建或复用 DM 会话（幂等） */
@@ -304,6 +306,11 @@ export class ImService {
 
   /** 创建群组会话 */
   createGroup(req: CreateGroupRequest): ImConversation {
+    if (!req.title.trim()) throw new Error("group title is required");
+    const members = [...new Map([
+      ...req.members,
+      { id: req.ownerId, type: "user" as const, role: "owner" as const },
+    ].map(member => [member.id, member])).values()];
     const id = genId();
     const ts = now();
 
@@ -314,7 +321,7 @@ export class ImService {
          VALUES (?, 'group', ?, 0, ?, ?)`
       ).run(id, req.title, ts, ts);
 
-      for (const m of req.members) {
+      for (const m of members) {
         this.db.prepare(
           `INSERT INTO im_conversation_member (conversation_id, user_or_bot_id, member_type, role, joined_at)
            VALUES (?, ?, ?, ?, ?)`
@@ -336,7 +343,7 @@ export class ImService {
       createdAt: ts,
       updatedAt: ts,
       preview: "",
-      memberCount: req.members.length,
+      memberCount: members.length,
     };
   }
 
@@ -380,6 +387,27 @@ export class ImService {
     ).run(title, now(), conversationId);
   }
 
+  /** 删除会话及其所有关联数据（消息、成员、状态、outbox 事件） */
+  deleteConversation(conversationId: string): boolean {
+    const conv = this.getConversation(conversationId);
+    if (!conv) return false;
+
+    this.db.exec("BEGIN");
+    try {
+      this.db.prepare("DELETE FROM im_reaction WHERE message_id IN (SELECT id FROM im_message WHERE conversation_id = ?)").run(conversationId);
+      this.db.prepare("DELETE FROM im_message WHERE conversation_id = ?").run(conversationId);
+      this.db.prepare("DELETE FROM im_conversation_member WHERE conversation_id = ?").run(conversationId);
+      this.db.prepare("DELETE FROM im_conversation_state WHERE conversation_id = ?").run(conversationId);
+      this.db.prepare("DELETE FROM im_event_outbox WHERE channel = ?").run(`conversation:${conversationId}`);
+      this.db.prepare("DELETE FROM im_conversation WHERE id = ?").run(conversationId);
+      this.db.exec("COMMIT");
+      return true;
+    } catch (e) {
+      this.db.exec("ROLLBACK");
+      throw e;
+    }
+  }
+
   // ─── 成员管理 ───────────────────────────────────────
 
   addMember(conversationId: string, userId: string, type: MemberType, role: MemberRole = "member"): void {
@@ -397,8 +425,16 @@ export class ImService {
 
   listMembers(conversationId: string): ImMember[] {
     return this.db.prepare(
-      "SELECT * FROM im_conversation_member WHERE conversation_id = ?"
+      `SELECT conversation_id AS conversationId, user_or_bot_id AS userOrBotId,
+        member_type AS memberType, role, joined_at AS joinedAt
+       FROM im_conversation_member WHERE conversation_id = ?`
     ).all(conversationId) as ImMember[];
+  }
+
+  listContacts(): Array<{ id: string; name: string; type: "user" | "bot" }> {
+    return this.db.prepare(`SELECT DISTINCT user_or_bot_id AS id, user_or_bot_id AS name,
+      member_type AS type FROM im_conversation_member ORDER BY user_or_bot_id`).all() as
+      Array<{ id: string; name: string; type: "user" | "bot" }>;
   }
 
   isMember(conversationId: string, userId: string): boolean {
@@ -487,6 +523,9 @@ export class ImService {
         JSON.stringify({ conversationId, seq, senderId: req.senderId }),
         ts, ts
       );
+
+      const persisted = this.db.prepare("SELECT * FROM im_message WHERE id=?").get(Number(result.lastInsertRowid)) as RawMessage;
+      this.onMessagePersisted?.(this.hydrateMessage(persisted));
 
       this.db.exec("COMMIT");
 
@@ -841,16 +880,17 @@ export class ImService {
     };
   }
 
-  search(query: string, options: { conversationId?: string; limit?: number } = {}): SearchResult[] {
+  search(query: string, options: { conversationId?: string; limit?: number; userId?: string } = {}): SearchResult[] {
     const limit = Math.min(options.limit ?? 20, 50);
 
     // 优先 FTS5（有排名、有索引、支持 snippet 高亮）
     try {
       const ftsQuery = query.split(/\s+/).map((w) => `"${w.replace(/"/g, "")}"`).join(" ");
       const ftsConvFilter = options.conversationId ? "AND f.conversation_id = ?" : "";
+      const memberFilter = options.userId ? "AND m.conversation_id IN (SELECT conversation_id FROM im_conversation_member WHERE user_or_bot_id = ?)" : "";
       const ftsParams = options.conversationId
-        ? [ftsQuery, options.conversationId, limit]
-        : [ftsQuery, limit];
+        ? [ftsQuery, options.conversationId, ...(options.userId ? [options.userId] : []), limit]
+        : [ftsQuery, ...(options.userId ? [options.userId] : []), limit];
 
       const ftsRaw = this.db.prepare(`
         SELECT
@@ -859,7 +899,7 @@ export class ImService {
           rank, m.created_at, m.sender_id
         FROM im_message_fts f
         JOIN im_message m ON m.id = f.rowid
-        WHERE im_message_fts MATCH ? ${ftsConvFilter}
+        WHERE im_message_fts MATCH ? AND m.is_deleted = 0 ${ftsConvFilter} ${memberFilter}
         ORDER BY rank
         LIMIT ?
       `).all(...ftsParams) as Array<Record<string, unknown>>;
@@ -874,9 +914,10 @@ export class ImService {
     // FTS5 无结果或不可用 → LIKE 子串匹配兜底（CJK 兼容）
     const likeQuery = `%${query}%`;
     const convFilter = options.conversationId ? "AND conversation_id = ?" : "";
+    const memberFilter = options.userId ? "AND conversation_id IN (SELECT conversation_id FROM im_conversation_member WHERE user_or_bot_id = ?)" : "";
     const params = options.conversationId
-      ? [likeQuery, likeQuery, options.conversationId, limit]
-      : [likeQuery, likeQuery, limit];
+      ? [likeQuery, likeQuery, options.conversationId, ...(options.userId ? [options.userId] : []), limit]
+      : [likeQuery, likeQuery, ...(options.userId ? [options.userId] : []), limit];
 
     const rawResults = this.db.prepare(`
       SELECT
@@ -891,7 +932,7 @@ export class ImService {
       FROM im_message
       WHERE is_deleted = 0
         AND (content LIKE ? OR search_text LIKE ?)
-        ${convFilter}
+        ${convFilter} ${memberFilter}
       ORDER BY created_at DESC
       LIMIT ?
     `).all(...params) as Array<Record<string, unknown>>;

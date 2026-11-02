@@ -5,12 +5,14 @@
   "type": "module",
   "scripts": {
     "dev": "vite",
-    "build": "tsc --noEmit && vite build",
-    "build:demo": "tsc --noEmit && VITE_DEMO=1 vite build --base=/demo/ --outDir dist-demo",
+    "build": "node scripts/build.mjs",
+    "build:demo": "node scripts/build.mjs --demo",
     "preview": "vite preview",
     "test": "node --import tsx --test tests/*.test.ts src/*.test.ts src/terminal/*.test.ts src/terminal/*.test.mjs"
   },
   "dependencies": {
+    "@chatscope/chat-ui-kit-react": "^2.1.1",
+    "@chatscope/chat-ui-kit-styles": "^1.4.0",
     "@codemirror/commands": "^6.10.4",
     "@codemirror/language": "^6.12.4",
     "@codemirror/language-data": "^6.5.1",

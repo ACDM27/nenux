@@ -1,4 +1,5 @@
 import { create } from "zustand";
+import { uuid } from "../uuid";
 import {
   type Chord,
   DEFAULT_KEYBINDINGS,
@@ -128,6 +129,7 @@ export interface AgentGroupTopic {
 }
 
 export interface UserProfile {
+  imUserId?: string;
   nickname: string;
   avatar?: string;
 }
@@ -508,7 +510,7 @@ interface State {
   nudgeSplit: (dir: "left" | "right" | "up" | "down") => void;
 }
 
-const id = () => crypto.randomUUID();
+const id = () => uuid();
 
 // Beyond this, each column gets too narrow to be useful — cap pane-creating
 // actions (splitFocused, addPane) rather than let a tab grow without bound.

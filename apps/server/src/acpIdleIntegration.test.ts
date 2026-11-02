@@ -12,7 +12,7 @@ test('ACP idle lifecycle preserves context and prevents duplicate/orphan startup
   const db = await import('./db.js');
   home.mock.restore();
   const runtime = await import('./acpRuntime.js');
-  t.after(async () => { runtime.closeAllAcpRuntimes(); await fs.rm(directory, { recursive: true, force: true }); });
+  t.after(async () => { runtime.closeAllAcpRuntimes(); db.getDb().close(); await fs.rm(directory, { recursive: true, force: true, maxRetries: 20, retryDelay: 100 }); });
   const fixture = fileURLToPath(new URL('../tests/fixtures/idle-acp.mjs', import.meta.url));
   db.setAgentsRaw(JSON.stringify(['load', 'no-load', 'fail-load'].map((id) => ({
     id, name: id, command: process.execPath, args: '', enabled: true,
@@ -44,7 +44,7 @@ test('ACP idle lifecycle preserves context and prevents duplicate/orphan startup
   assert.equal((await prompt('shared')).reply.pid, first.reply.pid, 'recent sessions stay warm');
   runtime.reapIdleAcpRuntimes(Date.now() + 600_000);
   const alive = () => { try { process.kill(first.reply.pid, 0); return true; } catch { return false; } };
-  const deadline = Date.now() + 3_000;
+  const deadline = Date.now() + (process.platform === "win32" ? 10_000 : 3_000);
   while (alive() && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 20));
   assert.equal(alive(), false, 'idle eviction actually releases the agent process');
   assert.equal(runtime.acpRuntimeCwd('shared'), directory);

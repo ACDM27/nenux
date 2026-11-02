@@ -53,7 +53,7 @@ import { KillError, killProcess, readSystemStats } from "./systemStats.js";
 import { listSshConnections, listSshProfiles, saveSshProfileFromTarget, saveSshProfiles, sshArgsForConnection, testSshProfile } from "./ssh.js";
 import { SshPortForwarding } from "./sshPortForwarding.js";
 import { WebSocketServer, type WebSocket } from "ws";
-import { listConfig, saveConfig } from "./config.js";
+import { listConfig, saveConfig, loadConfig } from "./config.js";
 import { gatewayState, saveGatewayRoute, connectGatewayRoute, disconnectGatewayRoute, gatewayConnection, proxyGatewayRequest } from "./modelGateway.js";
 import {
   APP_IDS,
@@ -79,11 +79,16 @@ import {
   setScrollBatch,
   setSessionCwd,
   getDb,
+  getMeta,
+  setMeta,
 } from "./db.js";
 import { migrateImSchema, ImService } from "./imService.js";
 import { OutboxWorker } from "./imOutbox.js";
 import { HandoffService } from "./imHandoff.js";
-import { splitIntoBubbles } from "./imBubbleSplit.js";
+import { createImHttpHandler } from "./imRoutes.js";
+import { ImTaskService } from "./imTasks.js";
+import { createImAgentExecutor } from "./imAgentExecution.js";
+import { ImAttachmentService } from "./imAttachments.js";
 import {
   createSubscriptionManager,
   registerConnection,
@@ -703,14 +708,65 @@ setInterval(flushScroll, 10_000).unref();
 const imDb = getDb();
 migrateImSchema(imDb);
 const imService = new ImService(imDb);
-const handoffService = new HandoffService(imDb, imService);
+const imAttachments = new ImAttachmentService(imDb, imService, path.join(process.env.TERMANY_DATA_DIR || path.join(os.homedir(), ".termany"), "im-attachments"));
+const handoffService = new HandoffService(imDb, imService, async (prompt, signal) => {
+  let output = "";
+  await streamAgentChat(undefined, [{ role: "user", content: prompt }], signal, text => { output += text; });
+  return output;
+});
+const imTasks = new ImTaskService(imDb, imService, {
+  defaultCwd: process.cwd(),
+  execute: createImAgentExecutor({ im: imService, agents: () => listAgentConfigs().agents, attachments: imAttachments,
+    prompt: async input => {
+      await promptAcpRuntime({ ...input, cwdExplicit: true,
+        emit: event => {
+          if (event.type === "delta") input.delta(event.text);
+          if (event.type === "permission") input.permission({ paneId: input.paneId, requestId: event.requestId, title: event.title, options: event.options });
+        } });
+    },
+  }),
+});
+imService.onMessagePersisted = message => {
+  const task = imTasks.enqueue(message);
+  if (task && message.metadata.handoffSnapshotId) handoffService.linkTask(message.metadata.handoffSnapshotId, task.id, message.conversationId);
+};
+const handleImRequest = createImHttpHandler({ imService, handoffService, readJson, agents: () => listAgentConfigs().agents, tasks: imTasks, attachments: imAttachments, respondPermission: respondAcpPermission,
+  capabilities: async () => {
+    const config = loadConfig();
+    const provider = config.providers.find(item => item.id === config.defaultModel.split("/")[0]);
+    return { llmConfigured: !!(config.defaultModel.includes("/") && provider?.apiKey.trim()),
+      agents: await Promise.all(listAgentConfigs().agents.filter(agent => agent.enabled).map(async agent => {
+        try { const result = await detectAgentExecutable(agent); return { id: agent.id, available: result.installed, reason: result.error }; }
+        catch { return { id: agent.id, available: false, reason: "运行环境检测失败，请检查智能体设置" }; }
+      })) };
+  },
+});
+
+// ─── 一次性清理"新建 Bot"对话 ───────────────────────────
+// 清理 agentConversations 中标题为 "New agent" / "New conversation" / "New bot" 的条目
+try {
+  const agentConversationsJson = getMeta("agentConversations");
+  if (agentConversationsJson) {
+    const conversations = JSON.parse(agentConversationsJson);
+    const originalCount = conversations.length;
+    const filtered = conversations.filter((conv: any) =>
+      !["New agent", "New conversation", "New bot"].includes(conv?.title)
+    );
+    if (filtered.length < originalCount) {
+      setMeta("agentConversations", JSON.stringify(filtered));
+      console.log(`[Cleanup] Removed ${originalCount - filtered.length} "New bot" conversations (${originalCount} -> ${filtered.length})`);
+    }
+  }
+} catch (e) {
+  console.error("[Cleanup] Failed to clean agent conversations:", e);
+}
 
 // One HTTP server hosts both the WebSocket upgrade (PTY sessions) and a small
 // JSON API (POST /api/theme — AI theme generation, key stays server-side).
 const http = createServer(async (req, res) => {
   res.setHeader("Access-Control-Allow-Origin", "*");
-  res.setHeader("Access-Control-Allow-Methods", "GET, POST, PUT, OPTIONS");
-  res.setHeader("Access-Control-Allow-Headers", "Content-Type, X-Image-Type");
+  res.setHeader("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type, X-Image-Type, X-File-Name");
 
   if (req.method === "OPTIONS") {
     res.writeHead(204).end();
@@ -1919,361 +1975,8 @@ const http = createServer(async (req, res) => {
     return;
   }
 
-  // ─── IM 消息系统 API ────────────────────────────────────
-
-  // 会话列表
-  if (req.method === "GET" && reqUrl.pathname === "/api/im/conversations") {
-    try {
-      const userId = reqUrl.searchParams.get("user_id") || "default-user";
-      const limit = Number(reqUrl.searchParams.get("limit") || "50");
-      const conversations = imService.listConversations(userId, limit);
-      json(200, { ok: true, data: conversations });
-    } catch (e) { fail(e); }
-    return;
-  }
-
-  // 创建 DM
-  if (req.method === "POST" && reqUrl.pathname === "/api/im/conversations/dm") {
-    readJson(req).then((body) => {
-      try {
-        const conv = imService.createDm({
-          userId: String(body?.userId ?? "default-user"),
-          targetId: String(body?.targetId ?? ""),
-          targetType: body?.targetType === "bot" ? "bot" : "user",
-        });
-        json(200, { ok: true, data: conv });
-      } catch (e) { fail(e); }
-    }).catch(fail);
-    return;
-  }
-
-  // 创建群组
-  if (req.method === "POST" && reqUrl.pathname === "/api/im/conversations/group") {
-    readJson(req).then((body) => {
-      try {
-        const conv = imService.createGroup({
-          title: String(body?.title ?? ""),
-          ownerId: String(body?.ownerId ?? "default-user"),
-          members: Array.isArray(body?.members) ? body.members : [],
-          clientRequestId: body?.clientRequestId,
-        });
-        json(200, { ok: true, data: conv });
-      } catch (e) { fail(e); }
-    }).catch(fail);
-    return;
-  }
-
-  // 获取单个会话
-  if (req.method === "GET" && reqUrl.pathname.startsWith("/api/im/conversations/") && reqUrl.pathname.split("/").length === 5) {
-    try {
-      const convId = reqUrl.pathname.split("/")[4];
-      const conv = imService.getConversation(convId);
-      if (!conv) { json(404, { error: "conversation not found" }); return; }
-      json(200, { ok: true, data: conv });
-    } catch (e) { fail(e); }
-    return;
-  }
-
-  // 获取消息历史（cursor 分页）
-  if (req.method === "GET" && reqUrl.pathname.match(/^\/api\/im\/conversations\/[^/]+\/messages$/)) {
-    try {
-      const parts = reqUrl.pathname.split("/");
-      const convId = parts[4];
-      const beforeSeq = reqUrl.searchParams.get("before_seq");
-      const limit = Number(reqUrl.searchParams.get("limit") || "40");
-      const userId = reqUrl.searchParams.get("user_id") || "default-user";
-
-      const page = imService.getMessages(convId, {
-        beforeSeq: beforeSeq ? Number(beforeSeq) : undefined,
-        limit,
-        userId,
-      });
-      json(200, { ok: true, data: page });
-    } catch (e) { fail(e); }
-    return;
-  }
-
-  // 发送消息
-  if (req.method === "POST" && reqUrl.pathname.match(/^\/api\/im\/conversations\/[^/]+\/messages$/)) {
-    readJson(req).then((body) => {
-      try {
-        const parts = reqUrl.pathname.split("/");
-        const convId = parts[4];
-        const msg = imService.sendMessage(convId, {
-          senderId: String(body?.senderId ?? "default-user"),
-          senderType: body?.senderType === "agent" ? "agent" : "user",
-          role: body?.role === "assistant" ? "assistant" : "user",
-          content: String(body?.content ?? ""),
-          messageType: body?.messageType ?? "text",
-          metadata: body?.metadata ?? {},
-          replyToSeq: body?.replyToSeq ? Number(body.replyToSeq) : undefined,
-          clientRequestId: body?.clientRequestId,
-        });
-        json(200, { ok: true, data: msg });
-      } catch (e) { fail(e); }
-    }).catch(fail);
-    return;
-  }
-
-  // 编辑消息
-  if (req.method === "PUT" && reqUrl.pathname.match(/^\/api\/im\/messages\/\d+$/)) {
-    readJson(req).then((body) => {
-      try {
-        const msgId = Number(reqUrl.pathname.split("/")[3]);
-        const senderId = String(body?.senderId ?? "default-user");
-        const msg = imService.editMessage(msgId, senderId, String(body?.content ?? ""));
-        json(200, { ok: true, data: msg });
-      } catch (e) { fail(e); }
-    }).catch(fail);
-    return;
-  }
-
-  // 撤回消息
-  if (req.method === "DELETE" && reqUrl.pathname.match(/^\/api\/im\/messages\/\d+$/)) {
-    try {
-      const msgId = Number(reqUrl.pathname.split("/")[3]);
-      const senderId = reqUrl.searchParams.get("sender_id") || "default-user";
-      imService.deleteMessage(msgId, senderId);
-      json(200, { ok: true });
-    } catch (e) { fail(e); }
-    return;
-  }
-
-  // 标记已读
-  if (req.method === "POST" && reqUrl.pathname.match(/^\/api\/im\/conversations\/[^/]+\/read$/)) {
-    readJson(req).then((body) => {
-      try {
-        const convId = reqUrl.pathname.split("/")[3];
-        const userId = String(body?.userId ?? "default-user");
-        const seq = Number(body?.seq ?? 0);
-        imService.markAsRead(convId, userId, seq);
-        json(200, { ok: true });
-      } catch (e) { fail(e); }
-    }).catch(fail);
-    return;
-  }
-
-  // 未读计数
-  if (req.method === "GET" && reqUrl.pathname === "/api/im/unread-counts") {
-    try {
-      const userId = reqUrl.searchParams.get("user_id") || "default-user";
-      const counts = imService.getUnreadCounts(userId);
-      json(200, { ok: true, data: counts });
-    } catch (e) { fail(e); }
-    return;
-  }
-
-  // 搜索
-  if (req.method === "GET" && reqUrl.pathname === "/api/im/search") {
-    try {
-      const query = reqUrl.searchParams.get("q") || "";
-      const convId = reqUrl.searchParams.get("conversation_id") || undefined;
-      const limit = Number(reqUrl.searchParams.get("limit") || "20");
-      if (!query) { json(200, { ok: true, data: [] }); return; }
-      const results = imService.search(query, { conversationId: convId, limit });
-      json(200, { ok: true, data: results });
-    } catch (e) { fail(e); }
-    return;
-  }
-
-  // 置顶会话
-  if (req.method === "POST" && reqUrl.pathname.match(/^\/api\/im\/conversations\/[^/]+\/pin$/)) {
-    readJson(req).then((body) => {
-      try {
-        const convId = reqUrl.pathname.split("/")[3];
-        const userId = String(body?.userId ?? "default-user");
-        const pinned = body?.pinned !== false;
-        imService.pinConversation(convId, userId, pinned);
-        json(200, { ok: true });
-      } catch (e) { fail(e); }
-    }).catch(fail);
-    return;
-  }
-
-  // 静音会话
-  if (req.method === "POST" && reqUrl.pathname.match(/^\/api\/im\/conversations\/[^/]+\/mute$/)) {
-    readJson(req).then((body) => {
-      try {
-        const convId = reqUrl.pathname.split("/")[3];
-        const userId = String(body?.userId ?? "default-user");
-        const muted = body?.muted !== false;
-        imService.muteConversation(convId, userId, muted);
-        json(200, { ok: true });
-      } catch (e) { fail(e); }
-    }).catch(fail);
-    return;
-  }
-
-  // 表情回应
-  if (req.method === "POST" && reqUrl.pathname.match(/^\/api\/im\/messages\/\d+\/reactions$/)) {
-    readJson(req).then((body) => {
-      try {
-        const msgId = Number(reqUrl.pathname.split("/")[3]);
-        const userId = String(body?.userId ?? "default-user");
-        const emoji = String(body?.emoji ?? "");
-        if (body?.remove) {
-          imService.removeReaction(msgId, userId, emoji);
-        } else {
-          imService.addReaction(msgId, userId, emoji);
-        }
-        json(200, { ok: true });
-      } catch (e) { fail(e); }
-    }).catch(fail);
-    return;
-  }
-
-  // 置顶消息
-  if (req.method === "POST" && reqUrl.pathname.match(/^\/api\/im\/messages\/\d+\/pin$/)) {
-    readJson(req).then((body) => {
-      try {
-        const msgId = Number(reqUrl.pathname.split("/")[3]);
-        const pinned = body?.pinned !== false;
-        imService.pinMessage(msgId, pinned);
-        json(200, { ok: true });
-      } catch (e) { fail(e); }
-    }).catch(fail);
-    return;
-  }
-
-  // 获取置顶消息
-  if (req.method === "GET" && reqUrl.pathname.match(/^\/api\/im\/conversations\/[^/]+\/pinned$/)) {
-    try {
-      const convId = reqUrl.pathname.split("/")[3];
-      const messages = imService.getPinnedMessages(convId);
-      json(200, { ok: true, data: messages });
-    } catch (e) { fail(e); }
-    return;
-  }
-
-  // ─── 气泡拆分 API ──────────────────────────────────────
-
-  // 预览气泡拆分（不写入，仅返回拆分结果）
-  if (req.method === "POST" && reqUrl.pathname === "/api/im/messages/split-preview") {
-    readJson(req).then((body) => {
-      try {
-        const content = String(body?.content ?? "");
-        const result = splitIntoBubbles(content, {
-          maxBubbles: Number(body?.maxBubbles ?? 4),
-          minChars: Number(body?.minChars ?? 50),
-        });
-        json(200, { ok: true, data: result });
-      } catch (e) { fail(e); }
-    }).catch(fail);
-    return;
-  }
-
-  // 发送气泡拆分后的多条消息
-  if (req.method === "POST" && reqUrl.pathname.match(/^\/api\/im\/conversations\/[^/]+\/messages\/split$/)) {
-    readJson(req).then((body) => {
-      try {
-        const parts = reqUrl.pathname.split("/");
-        const convId = parts[4];
-        const content = String(body?.content ?? "");
-        const replyGroupId = randomUUID();
-        const split = splitIntoBubbles(content, { replyGroupId });
-
-        const messages = split.parts.map((part) =>
-          imService.sendMessage(convId, {
-            senderId: String(body?.senderId ?? "default-user"),
-            senderType: body?.senderType === "agent" ? "agent" : "user",
-            role: body?.role === "assistant" ? "assistant" : "user",
-            content: part,
-            replyGroupId,
-          })
-        );
-
-        json(200, { ok: true, data: { replyGroupId, messages } });
-      } catch (e) { fail(e); }
-    }).catch(fail);
-    return;
-  }
-
-  // ─── 侧链 API ──────────────────────────────────────────
-
-  // 创建侧链
-  if (req.method === "POST" && reqUrl.pathname.match(/^\/api\/im\/conversations\/[^/]+\/sidechains$/)) {
-    try {
-      const convId = reqUrl.pathname.split("/")[3];
-      const sidechainId = imService.createSidechain(convId);
-      json(200, { ok: true, data: { sidechainId } });
-    } catch (e) { fail(e); }
-    return;
-  }
-
-  // 获取侧链消息
-  if (req.method === "GET" && reqUrl.pathname.match(/^\/api\/im\/conversations\/[^/]+\/sidechains\/[^/]+$/)) {
-    try {
-      const parts = reqUrl.pathname.split("/");
-      const convId = parts[4];
-      const sidechainId = parts[6];
-      const messages = imService.getSidechainMessages(convId, sidechainId);
-      json(200, { ok: true, data: messages });
-    } catch (e) { fail(e); }
-    return;
-  }
-
-  // 列出侧链
-  if (req.method === "GET" && reqUrl.pathname.match(/^\/api\/im\/conversations\/[^/]+\/sidechains$/)) {
-    try {
-      const convId = reqUrl.pathname.split("/")[3];
-      const sidechains = imService.listSidechains(convId);
-      json(200, { ok: true, data: sidechains });
-    } catch (e) { fail(e); }
-    return;
-  }
-
-  // ─── Handoff 跨 Agent 接力 API ──────────────────────────
-
-  // 预览接力
-  if (req.method === "POST" && reqUrl.pathname === "/api/im/handoffs/preview") {
-    readJson(req).then((body) => {
-      try {
-        const snapshot = handoffService.prepareHandoff(
-          String(body?.conversationId ?? ""),
-          String(body?.sourceAgentId ?? ""),
-          (body?.targetAgent === "codex" ? "codex" : "claude-code"),
-          {
-            mode: body?.mode === "llm" ? "llm" : "rules",
-            handoffNote: String(body?.handoffNote ?? ""),
-            projectPath: String(body?.projectPath ?? ""),
-          }
-        );
-        const rendered = handoffService.renderPreview(snapshot);
-        json(200, { ok: true, data: { snapshot, rendered } });
-      } catch (e) { fail(e); }
-    }).catch(fail);
-    return;
-  }
-
-  // 执行接力
-  if (req.method === "POST" && reqUrl.pathname === "/api/im/handoffs") {
-    readJson(req).then((body) => {
-      try {
-        const snapshot = handoffService.prepareHandoff(
-          String(body?.conversationId ?? ""),
-          String(body?.sourceAgentId ?? ""),
-          (body?.targetAgent === "codex" ? "codex" : "claude-code"),
-          {
-            mode: body?.mode === "llm" ? "llm" : "rules",
-            handoffNote: String(body?.handoffNote ?? ""),
-            projectPath: String(body?.projectPath ?? ""),
-          }
-        );
-        const result = handoffService.executeHandoff(snapshot);
-        json(200, { ok: true, data: result });
-      } catch (e) { fail(e); }
-    }).catch(fail);
-    return;
-  }
-
-  // 列出接力记录
-  if (req.method === "GET" && reqUrl.pathname === "/api/im/handoffs") {
-    try {
-      const convId = reqUrl.searchParams.get("conversation_id") || undefined;
-      const limit = Number(reqUrl.searchParams.get("limit") || "20");
-      const handoffs = handoffService.listHandoffs(convId, limit);
-      json(200, { ok: true, data: handoffs });
-    } catch (e) { fail(e); }
+  if (reqUrl.pathname.startsWith("/api/im/")) {
+    handleImRequest(req, res);
     return;
   }
 
@@ -2289,7 +1992,7 @@ let listenAttempts = 0;
 
 function tryListen(): void {
   listenAttempts++;
-  http.listen(PORT, () => {
+  http.listen(PORT, process.env.TERMANY_HOST, () => {
     console.log(`[termany] PTY server listening on ws://localhost:${PORT}  (shell: ${SHELL})`);
   });
 }
@@ -2312,7 +2015,7 @@ http.on("error", (err: NodeJS.ErrnoException) => {
 const wss = new WebSocketServer({ server: http });
 
 // ─── IM 事件广播系统 ──────────────────────────────────────
-const imSubs = createSubscriptionManager();
+const imSubs = createSubscriptionManager((conversationId, userId) => imService.isMember(conversationId, userId));
 
 // Outbox Worker 使用订阅管理器投递事件
 const imOutboxWorker = new OutboxWorker({
@@ -2542,7 +2245,7 @@ wss.on("connection", async (ws: WebSocket, req) => {
       const msg = JSON.parse(raw.toString());
       console.log(`[IM] 📨 Client #${cid} message:`, msg.type, msg.channel);
       if (msg.type === "subscribe" || msg.type === "unsubscribe" || msg.type === "typing") {
-        handleClientMessage(imSubs, imConnId, raw.toString());
+        handleClientMessage(imSubs, imConnId, raw.toString(), (conversationId, userId) => imService.isMember(conversationId, userId));
       }
     } catch {
       // 非 JSON 消息 → PTY 输入，由下游处理
@@ -2796,6 +2499,7 @@ async function shutdown() {
     }
   }
   closeAllAcpRuntimes();
+  imTasks.stop();
   process.exit(0);
 }
 process.on("SIGINT", shutdown);

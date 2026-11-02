@@ -12,7 +12,7 @@ test("native bots support model selection, continuous turns, permissions and can
   const db = await import("./db.js");
   home.mock.restore();
   const runtime = await import("./acpRuntime.js");
-  t.after(async () => { runtime.closeAllAcpRuntimes(); await fs.rm(directory, { recursive: true, force: true }); });
+  t.after(async () => { runtime.closeAllAcpRuntimes(); db.getDb().close(); await fs.rm(directory, { recursive: true, force: true, maxRetries: 20, retryDelay: 100 }); });
   const fixture = fileURLToPath(new URL("../tests/fixtures/native-acp.mjs", import.meta.url));
   db.setAgentsRaw(JSON.stringify(["gemini", "kimi", "kilocode", "cursor", "image", "corrupt", "exit", "child"].map((id) => ({
     // Terminal launch and native conversation support are independent: Kimi's

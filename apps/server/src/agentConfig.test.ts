@@ -10,7 +10,7 @@ test("registry upgrades add native runtimes without overwriting opt-outs or cust
   const home = t.mock.method(os, "homedir", () => directory);
   const db = await import("./db.js");
   home.mock.restore();
-  t.after(() => fs.rm(directory, { recursive: true, force: true }));
+  t.after(async () => { db.getDb().close(); await fs.rm(directory, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }); });
   const { listAgentConfigs, saveAgentConfigs } = await import("./agentConfig.js");
   const defaults = listAgentConfigs().agents;
   const commands = { gemini: ["gemini", "--acp"], grok: ["grok", "agent stdio"], kimi: ["kimi", "acp"], cursor: ["cursor-agent", "acp"] };
@@ -24,9 +24,11 @@ test("registry upgrades add native runtimes without overwriting opt-outs or cust
   assert.deepEqual(defaults.find((agent) => agent.id === "fastclaw")?.runtime, defaultAgentRuntime("fastclaw"));
   for (const id of ["claude", "codex"]) {
     const runtime = defaults.find((agent) => agent.id === id)?.runtime;
-    assert.equal(runtime?.protocol, "acp");
-    if (runtime?.protocol === "acp") assert.equal(runtime.distribution, "managed");
+    assert.deepEqual(runtime, defaultAgentRuntime(id));
+    if (id === "claude" && runtime?.protocol === "acp") assert.equal(runtime.distribution, "managed");
   }
+  const oauth = saveAgentConfigs(defaults.map(agent => agent.id === "codex" ? { ...agent, runtime: { protocol: "chatgpt-oauth", model: "chosen-model" } } : agent));
+  assert.deepEqual(oauth.find(agent => agent.id === "codex")?.runtime, { protocol: "chatgpt-oauth", model: "chosen-model" });
   assert.equal(defaults.some((agent) => agent.id === "kilocode" || agent.id === "droid"), false);
   assert.equal(defaults.findIndex((agent) => agent.id === "grok"), defaults.findIndex((agent) => agent.id === "gemini") + 1);
   const legacyFastClaw = defaults.map((agent) => agent.id === "fastclaw" ? {

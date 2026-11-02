@@ -6,9 +6,11 @@ import type { LoadedAgentImage } from "./agentImages.js";
 import { botAcpPrompt } from "./botIdentity.js";
 import { getValidCredentials, type ChatGPTCredentials } from "./chatgptOAuth.js";
 import { loadCredentials } from "./chatgptCredentialStore.js";
-import { CODEX_MODELS, type CodexModel, streamCodexResponse } from "./chatgptCodexProvider.js";
+import { CODEX_MODELS, type CodexModel, type CodexMessage, streamCodexResponse } from "./chatgptCodexProvider.js";
 
 type Emit = (event: AcpRuntimeEvent) => void;
+const defaultDependencies = { loadCredentials, getValidCredentials, streamCodexResponse };
+type RuntimeDependencies = typeof defaultDependencies;
 
 /**
  * ChatGPT OAuth Runtime - uses ChatGPT Plus/Pro subscription via OAuth.
@@ -18,13 +20,17 @@ export class ChatGPTOAuthRuntime {
   private prompting = false;
   private sessionId: string = randomUUID();
   private configOptions: SessionConfigOption[] = [];
+  private history: CodexMessage[] = [];
+  private request?: AbortController;
+  private closed = false;
 
   private constructor(
     readonly paneId: string,
     readonly agent: AgentConfig,
     readonly cwd: string,
     private credentials: ChatGPTCredentials,
-    private model: CodexModel
+    private model: CodexModel,
+    private dependencies: RuntimeDependencies
   ) {
     // Build config options for model selection
     this.configOptions = [
@@ -42,26 +48,26 @@ export class ChatGPTOAuthRuntime {
     ];
   }
 
-  static async create(paneId: string, agent: AgentConfig, cwd: string): Promise<ChatGPTOAuthRuntime> {
+  static async create(paneId: string, agent: AgentConfig, cwd: string, dependencies: RuntimeDependencies = defaultDependencies): Promise<ChatGPTOAuthRuntime> {
     const spec = agent.runtime;
     if (!spec || spec.protocol !== "chatgpt-oauth") {
       throw new Error(`${agent.name} has no ChatGPT OAuth runtime configured`);
     }
 
     // Load and validate ChatGPT credentials
-    const stored = loadCredentials();
+    const stored = dependencies.loadCredentials();
     if (!stored) {
       throw new Error("ChatGPT login required. Please login first.");
     }
 
-    const credentials = await getValidCredentials(stored);
+    const credentials = await dependencies.getValidCredentials(stored);
     if (!credentials) {
       throw new Error("ChatGPT login expired. Please login again.");
     }
 
     const model = (spec.model as CodexModel) || "gpt-5.6-sol";
 
-    return new ChatGPTOAuthRuntime(paneId, agent, cwd, credentials, model);
+    return new ChatGPTOAuthRuntime(paneId, agent, cwd, credentials, model, dependencies);
   }
 
   get config(): SessionConfigOption[] {
@@ -90,13 +96,17 @@ export class ChatGPTOAuthRuntime {
   }
 
   async prompt(text: string, emit: Emit, signal: AbortSignal, botIdentity?: unknown, images: LoadedAgentImage[] = []): Promise<void> {
+    if (this.closed) throw new Error("Agent conversation is closed");
     signal.throwIfAborted();
     if (this.prompting) throw new Error("This agent is already responding");
     this.prompting = true;
+    const controller = new AbortController();
+    this.request = controller;
+    signal = AbortSignal.any([signal, controller.signal]);
 
     try {
       // Refresh credentials if needed
-      const credentials = await getValidCredentials(this.credentials);
+      const credentials = await this.dependencies.getValidCredentials(this.credentials);
       if (!credentials) {
         throw new Error("ChatGPT login expired. Please login again.");
       }
@@ -106,44 +116,37 @@ export class ChatGPTOAuthRuntime {
       const base = botAcpPrompt(text, botIdentity);
       const promptText = typeof base === "string" ? base : base.map((block) => block.text).join("\n\n");
 
-      // Handle images if any
-      let fullPrompt = promptText;
-      if (images.length > 0) {
-        fullPrompt += "\n\nAttached local image files:\n" + images.map((img) => img.path).join("\n");
-      }
-
       emit({ type: "activity", title: this.agent.name, status: "Thinking", phase: "processing" });
 
       // Call ChatGPT Codex API
-      const messages = [
-        { role: "user" as const, content: fullPrompt },
-      ];
+      const messages: CodexMessage[] = [...this.history, { role: "user", content: promptText, images: images.map(image => ({ mimeType: image.mimeType, data: image.data })) }];
+      while (messages.length > 1 && (messages.length > 40 || JSON.stringify(messages).length > 500_000)) messages.shift();
 
       // Build instructions with model identity
       const modelName = CODEX_MODELS.find(m => m.id === this.model)?.name || this.model;
       const instructions = `You are ${modelName}, a large language model trained by OpenAI. You are running inside Termany, a multi-agent terminal application. When asked about your identity or model, you can tell the user that you are ${modelName}.`;
 
-      for await (const chunk of streamCodexResponse(this.credentials, this.model, messages, { signal, instructions })) {
+      let output = "";
+      for await (const chunk of this.dependencies.streamCodexResponse(this.credentials, this.model, messages, { signal, instructions })) {
         signal.throwIfAborted();
 
         if (chunk.type === "text") {
-          emit({ type: "delta", text: chunk.text });
+          output += chunk.text || "";
+          emit({ type: "delta", text: chunk.text || "" });
         } else if (chunk.type === "tool_call" && chunk.toolCall) {
-          emit({
-            type: "tool",
-            id: chunk.toolCall.id,
-            title: chunk.toolCall.name,
-            input: chunk.toolCall.arguments,
-          });
+          throw new Error("This OAuth runtime cannot execute local tool calls; select a CLI/ACP runtime for file operations");
         } else if (chunk.type === "error") {
-          emit({ type: "delta", text: `\n\n**Error**: ${chunk.error}` });
-          break;
+          throw new Error(chunk.error || "ChatGPT model request failed");
         }
       }
 
+      signal.throwIfAborted();
+      if (!output.trim()) throw new Error("ChatGPT returned no content");
+      this.history = [...messages, { role: "assistant", content: output }];
       emit({ type: "done", sessionId: this.sessionId });
     } finally {
       this.prompting = false;
+      if (this.request === controller) this.request = undefined;
     }
   }
 
@@ -153,6 +156,8 @@ export class ChatGPTOAuthRuntime {
   }
 
   close(): void {
-    // Nothing to clean up - no child process
+    this.closed = true;
+    this.request?.abort(new Error("Agent conversation was closed"));
+    this.history = [];
   }
 }

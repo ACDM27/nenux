@@ -1,6 +1,7 @@
 import { AGENT_RUNTIME_REVISION, defaultAgentRuntime, inheritsDefaultAgentRuntime } from "@termany/core";
 import { useEffect, useState } from "react";
 import { apiPath } from "./api";
+import { uuid } from "./uuid";
 import { buildAgentCommand, normalizeCustomAgentCommand } from "./agentCommand";
 import claudeIcon from "./assets/agents/claudecode.svg?url";
 import codexIcon from "./assets/agents/codex.svg?url";
@@ -54,6 +55,10 @@ export type AgentRuntimeConfig = {
   protocol: "acp-http";
   endpoint: string;
   apiKey: string;
+} | {
+  /** ChatGPT OAuth - uses ChatGPT Plus/Pro subscription via OAuth. */
+  protocol: "chatgpt-oauth";
+  model: string;
 };
 
 type StoredAgentConfig = Partial<Omit<AgentConfig,
@@ -297,7 +302,7 @@ export function agentCommand(agent: AgentConfig) {
 }
 
 export function createCustomAgent(): AgentConfig {
-  const id = crypto.randomUUID();
+  const id = uuid();
   return {
     id,
     name: "Custom Agent",

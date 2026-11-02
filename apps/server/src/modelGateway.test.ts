@@ -12,10 +12,10 @@ const realHomedir = os.homedir;
 os.homedir = () => testHome;
 const { saveConfig } = await import("./config.js");
 const { saveAgentConfigs, listAgentConfigs } = await import("./agentConfig.js");
-const { setMeta, getMeta } = await import("./db.js");
+const { setMeta, getMeta, getDb } = await import("./db.js");
 const { saveGatewayRoute, gatewayState, gatewayConnection, connectGatewayRoute, disconnectGatewayRoute, resolveGatewayRoute, gatewayUpstreamUrl, proxyGatewayRequest, gatewayModelCatalog } = await import("./modelGateway.js");
 const { readTopLevelKey, readSection } = await import("./agentProviders/toml.js");
-after(() => { os.homedir = realHomedir; fs.rmSync(testHome, { recursive: true, force: true }); });
+after(() => { os.homedir = realHomedir; getDb().close(); fs.rmSync(testHome, { recursive: true, force: true, maxRetries: 20, retryDelay: 100 }); });
 const providers = [
   { id: "a", name: "Anthropic", kind: "anthropic" as const, apiBase: "", apiKey: "upstream-anthropic-secret", models: ["claude-one", "shared"] },
   { id: "b", name: "OpenAI", kind: "openai" as const, apiBase: "", apiKey: "upstream-openai-secret", models: ["gpt-one", "shared"] },

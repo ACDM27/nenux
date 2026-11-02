@@ -4,7 +4,7 @@ import { GitDiff } from "./components/GitDiff";
 import { HTabBar } from "./components/HTabBar";
 import { AgentWorkspace } from "./components/AgentWorkspace";
 import { AppTabRail, type AppTab } from "./components/AppTabRail";
-import { Inbox } from "./components/Inbox";
+import { InboxV2 as Inbox } from "./components/InboxV2";
 import { QuitConfirm } from "./components/QuitConfirm";
 import { ResizeHandles } from "./components/ResizeHandles";
 import { SearchPalette } from "./components/SearchPalette";

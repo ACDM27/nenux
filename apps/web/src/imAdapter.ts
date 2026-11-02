@@ -63,7 +63,7 @@ export function useImBridge() {
   const userId = "default-user"; // TODO: 从 store.userProfile 读取
   const syncingRef = useRef(false);
 
-  const addConversation = useStore((s) => s.addAgentConversation);
+  const addConversation = useStore((s) => s.addAgentConversation) as unknown as (conv: AgentConversation) => void;
   const setAgentMessages = useStore((s) => s.setAgentMessages);
   const markRead = useStore((s) => s.markAgentConversationRead);
 
@@ -124,9 +124,7 @@ export function useImBridge() {
       });
 
       // 同步到 store
-      const currentMsgs = useStore.getState().agentConversations
-        .find((c) => c.id === conversationId);
-      // setAgentMessages 会覆盖，所以需要追加
+      // TODO: 追加到现有消息列表而非覆盖
       const agentMsg = imMsgToAgentMsg(imMsg);
       // TODO: 追加到现有消息列表而非覆盖
 
@@ -145,9 +143,6 @@ export function useImBridge() {
 
     // 再通知后端
     try {
-      const msgs = useStore.getState().agentConversations
-        .find((c) => c.id === conversationId);
-      // 用最新消息的 seq
       await imApi.markAsRead(conversationId, userId, Date.now());
     } catch (e) {
       console.error("[IM Bridge] mark read failed:", e);
@@ -170,7 +165,6 @@ export function useImBridge() {
 
   useEffect(() => {
     // 监听 IM 事件，增量更新 store
-    const state = useStore.getState();
     // TODO: 注册事件监听器（当 imStore 收到事件时，同步到主 store）
 
     return () => {

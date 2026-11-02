@@ -12,7 +12,7 @@ import { DatabaseSync } from "node:sqlite";
  * ~/.termany/termany.db
  */
 
-const DIR = path.join(os.homedir(), ".termany");
+const DIR = process.env.TERMANY_DATA_DIR || path.join(os.homedir(), ".termany");
 mkdirSync(DIR, { recursive: true });
 
 const db = new DatabaseSync(path.join(DIR, "termany.db"));
@@ -94,6 +94,7 @@ export interface AppState {
   agentConversations: unknown[];
   userProfile: {
     nickname: string;
+    imUserId?: string;
     avatar?: string;
   };
   activeWorkspace: string;
@@ -118,8 +119,17 @@ export function loadState(): AppState {
         if (!parsed || typeof parsed !== "object" || typeof parsed.nickname !== "string") {
           return { nickname: "" };
         }
+        let imUserId = typeof parsed.imUserId === "string" ? parsed.imUserId.trim() : "";
+        if (!imUserId) {
+          const legacy = parsed.nickname.trim() || "default-user";
+          try {
+            const belongs = (id: string) => Boolean(db.prepare("SELECT 1 FROM im_conversation_member WHERE user_or_bot_id=? LIMIT 1").get(id));
+            imUserId = belongs(legacy) || !belongs("default-user") ? legacy : "default-user";
+          } catch { imUserId = legacy; }
+        }
         return {
           nickname: parsed.nickname,
+          imUserId,
           ...(typeof parsed.avatar === "string" && parsed.avatar ? { avatar: parsed.avatar } : {}),
         };
       } catch {
@@ -133,6 +143,7 @@ export function loadState(): AppState {
 
 export function saveState(state: AppState): void {
   const workspaces = Array.isArray(state.workspaces) ? state.workspaces : [];
+  const imUserId = state.userProfile?.imUserId || loadState().userProfile.imUserId;
   db.exec("BEGIN");
   try {
     db.exec("DELETE FROM workspace");
@@ -144,6 +155,7 @@ export function saveState(state: AppState): void {
     );
     setMeta("userProfile", JSON.stringify({
       nickname: typeof state.userProfile?.nickname === "string" ? state.userProfile.nickname : "",
+      ...(typeof imUserId === "string" && imUserId ? { imUserId } : {}),
       ...(typeof state.userProfile?.avatar === "string" && state.userProfile.avatar
         ? { avatar: state.userProfile.avatar }
         : {}),

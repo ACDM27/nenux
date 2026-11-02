@@ -27,10 +27,10 @@ test("usage rejects invalid and future dates", () => {
 });
 
 test("session history returns newest files one page at a time", async () => {
-  const originalHome = process.env.HOME;
+  const originalHomedir = os.homedir;
   const home = await fs.promises.mkdtemp(path.join(os.tmpdir(), "termany-agent-sessions-"));
   try {
-    process.env.HOME = home;
+    os.homedir = () => home;
     const dir = path.join(home, ".codex", "sessions", "2026", "08", "03");
     await fs.promises.mkdir(dir, { recursive: true });
     for (let i = 1; i <= 3; i++) {
@@ -55,8 +55,7 @@ test("session history returns newest files one page at a time", async () => {
     assert.deepEqual(second.sessions?.map((session) => session.sessionId), ["session-1"]);
     assert.equal(second.nextCursor, null);
   } finally {
-    if (originalHome === undefined) delete process.env.HOME;
-    else process.env.HOME = originalHome;
+    os.homedir = originalHomedir;
     await fs.promises.rm(home, { recursive: true, force: true });
   }
 });

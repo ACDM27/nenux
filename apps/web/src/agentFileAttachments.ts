@@ -1,4 +1,5 @@
 import type { AgentFileAttachment, AgentMessage } from "./state/store";
+import { uuid } from "./uuid";
 
 export function fileAttachmentName(path: string): string {
   return path.split(/[\\/]/).filter(Boolean).pop() ?? path;
@@ -6,7 +7,7 @@ export function fileAttachmentName(path: string): string {
 
 export function createAgentFileAttachment(path: string): AgentFileAttachment {
   return {
-    id: crypto.randomUUID(),
+    id: uuid(),
     kind: "file",
     path,
     name: fileAttachmentName(path),

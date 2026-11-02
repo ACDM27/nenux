@@ -23,6 +23,7 @@ export type CodexModel = typeof CODEX_MODELS[number]["id"];
 export interface CodexMessage {
   role: "user" | "assistant" | "system" | "developer";
   content: string;
+  images?: Array<{ mimeType: string; data: string }>;
 }
 
 export interface CodexToolCall {
@@ -66,7 +67,8 @@ export async function* streamCodexResponse(
     stream: true, // Codex REQUIRES stream=true
     input: messages.map((msg) => ({
       role: msg.role === "system" ? "developer" : msg.role,
-      content: [{ type: "input_text", text: msg.content }],
+      content: [{ type: msg.role === "assistant" ? "output_text" : "input_text", text: msg.content },
+        ...(msg.role === "user" ? (msg.images || []).map(image => ({ type: "input_image", image_url: `data:${image.mimeType};base64,${image.data}` })) : [])],
     })),
     instructions: instructions || "You are a helpful AI assistant.",
     parallel_tool_calls: true,

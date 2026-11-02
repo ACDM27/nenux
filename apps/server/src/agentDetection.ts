@@ -4,6 +4,7 @@ import { managedAcpAdapterPath, managedAcpDefinition } from "./managedAcp.js";
 import { checkNativeAcpSupport } from "./nativeAcp.js";
 import { resolveExecutable, spawnEnvironment } from "./shellPath.js";
 import { agentEnvironment } from "./agentEnvironment.js";
+import { loadCredentials } from "./chatgptCredentialStore.js";
 
 export type AgentDetection = {
   id?: string;
@@ -28,7 +29,9 @@ export function parseAgentDetectionInput(input: unknown): AgentConfig | undefine
   const rawRuntime = value.runtime && typeof value.runtime === "object"
     ? value.runtime as Record<string, unknown>
     : undefined;
-  const runtime = rawRuntime?.protocol === "acp-http" && /^https?:\/\//i.test(String(rawRuntime.endpoint ?? "").trim())
+  const runtime = rawRuntime?.protocol === "chatgpt-oauth" && typeof rawRuntime.model === "string" && rawRuntime.model.trim()
+    ? { protocol: "chatgpt-oauth" as const, model: rawRuntime.model.trim() }
+    : rawRuntime?.protocol === "acp-http" && /^https?:\/\//i.test(String(rawRuntime.endpoint ?? "").trim())
     ? {
         protocol: "acp-http" as const,
         endpoint: String(rawRuntime.endpoint).trim().replace(/\/+$/, ""),
@@ -123,6 +126,12 @@ export async function detectAgentExecutable(
     terminalInstalled: terminal.installed,
     ...(terminal.path ? { terminalPath: terminal.path } : {}),
   };
+  if (agent.runtime?.protocol === "chatgpt-oauth") {
+    const credentials = loadCredentials();
+    const ready = Boolean(credentials?.accessToken && (credentials.refreshToken || credentials.expiresAt > Date.now()));
+    return { id: agent.id, command: "chatgpt-oauth", installed: ready, ...terminalResult,
+      ...(!ready ? { error: "请先在模型设置中完成 ChatGPT 登录" } : {}) };
+  }
   if (agent.runtime?.protocol === "acp-http") {
     return { ...await detectHttpAcp(agent, env), ...terminalResult };
   }

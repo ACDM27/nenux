@@ -23,6 +23,8 @@ export type {
   SearchResult,
   SearchRequest,
   MessageMetadata,
+  ImAttachment,
   ImApiResponse,
 } from "./imTypes.js";
 export { ImEventType } from "./imTypes.js";
+export type { ImTask, ImTaskStatus, ImTaskStep, ImExecutionSettings } from "./imTasks.js";

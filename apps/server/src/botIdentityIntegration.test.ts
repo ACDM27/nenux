@@ -16,7 +16,8 @@ test("Bot identity reaches both provider formats and a reused ACP session", { ti
   const { promptAcpRuntime, closeAcpRuntimes } = await import("./acpRuntime.js");
   t.after(() => {
     closeAcpRuntimes(["identity-pane"]);
-    return fs.rm(directory, { recursive: true, force: true });
+    db.getDb().close();
+    return fs.rm(directory, { recursive: true, force: true, maxRetries: 20, retryDelay: 100 });
   });
 
   const messages = [{ role: "user" as const, content: "Who are you?" }];

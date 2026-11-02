@@ -318,6 +318,7 @@ export function AgentSettings({
                           <select value={agent.runtime.protocol} disabled>
                             <option value="acp">Agent Client Protocol (stdio)</option>
                             <option value="acp-http">Agent Communication Protocol 0.2 (HTTP)</option>
+                            <option value="chatgpt-oauth">ChatGPT OAuth (Plus/Pro)</option>
                           </select>
                         </label>
                         {agent.runtime.protocol === "acp-http" ? (
@@ -343,6 +344,16 @@ export function AgentSettings({
                               />
                             </label>
                           </>
+                        ) : agent.runtime.protocol === "chatgpt-oauth" ? (
+                          <label className="agent-field">
+                            <span>Model</span>
+                            <input
+                              {...textInputProps}
+                              value={agent.runtime.model}
+                              placeholder="gpt-5.6-sol"
+                              onChange={(event) => updateRuntime(agent, { model: event.target.value })}
+                            />
+                          </label>
                         ) : (
                           <>
                             <label className="agent-field">

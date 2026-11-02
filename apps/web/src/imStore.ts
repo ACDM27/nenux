@@ -1,3 +1,4 @@
+let searchVersion = 0;
 /**
  * IM Zustand Store
  *
@@ -6,7 +7,7 @@
  */
 
 import { create } from "zustand";
-import { imApi, type ImConversation, type ImMessage, type UnreadCount, type SearchResult } from "./imClient";
+import { imApi, type ImConversation, type ImMessage, type SearchResult } from "./imClient";
 
 // ─── 状态类型 ───────────────────────────────────────────
 
@@ -61,7 +62,7 @@ interface ImActions {
   removeMessage: (messageId: number) => void;
 
   // 发送
-  sendMessage: (content: string, opts?: { sidechainId?: string; replyGroupId?: string; replyToSeq?: number }) => Promise<void>;
+  sendMessage: (content: string, opts?: { sidechainId?: string; replyGroupId?: string; replyToSeq?: number; clientRequestId?: string; attachmentIds?: string[] }) => Promise<void>;
   editMessage: (messageId: number, content: string) => Promise<void>;
   deleteMessage: (messageId: number) => Promise<void>;
 
@@ -88,6 +89,14 @@ interface ImActions {
 
 export type ImStore = ImState & ImActions;
 
+function mergeMessages(...pages: ImMessage[][]): ImMessage[] {
+  return [...new Map(pages.flat().map(message => [message.id, message])).values()]
+    .sort((a, b) => a.seq - b.seq);
+}
+
+let messageRequest = 0;
+let unreadRequest = 0;
+
 // ─── Store 创建 ─────────────────────────────────────────
 
 export const useImStore = create<ImStore>((set, get) => ({
@@ -110,7 +119,14 @@ export const useImStore = create<ImStore>((set, get) => ({
 
   // ─── Actions ──────────────────────────────────────────
 
-  setUserId: (userId) => set({ userId }),
+  setUserId: (userId) => {
+    if (get().userId === userId) return;
+    messageRequest++;
+    searchVersion++;
+    set({ userId, conversations: [], activeConversationId: null, messages: [],
+      messagesLoading: false, messagesHasMore: false, messagesNextCursor: null,
+      unreadCounts: new Map(), typingUsers: new Map(), searchResults: [], searchQuery: "", searchLoading: false });
+  },
 
   // 会话列表
   loadConversations: async () => {
@@ -118,7 +134,7 @@ export const useImStore = create<ImStore>((set, get) => ({
     try {
       const { userId } = get();
       const conversations = await imApi.listConversations(userId);
-      set({ conversations, conversationsLoading: false });
+      if (get().userId === userId) set({ conversations, conversationsLoading: false });
     } catch (e) {
       console.error("[IM] loadConversations failed:", e);
       set({ conversationsLoading: false });
@@ -126,43 +142,62 @@ export const useImStore = create<ImStore>((set, get) => ({
   },
 
   setActiveConversation: (id) => {
-    set({ activeConversationId: id, messages: [], messagesHasMore: false, messagesNextCursor: null });
+    messageRequest++;
+    set({ activeConversationId: id, messages: [], messagesLoading: false, messagesHasMore: false, messagesNextCursor: null, typingUsers: new Map() });
     if (id) {
       get().loadMessages(id);
-      get().markAsRead(id);
+
     }
   },
 
   // 消息
   loadMessages: async (conversationId, opts) => {
+    if (get().activeConversationId !== conversationId) return;
+    const request = ++messageRequest;
+    const userId = get().userId;
+    const requestedIds = new Set(get().messages.map(message => message.id));
     set({ messagesLoading: true });
     try {
-      const { userId } = get();
-      const page = await imApi.getMessages(conversationId, {
+      let page = await imApi.getMessages(conversationId, {
         beforeSeq: opts?.beforeSeq,
         limit: 40,
         userId,
       });
+      const oldestLoadedSeq = Math.min(...get().messages.filter(message => requestedIds.has(message.id)).map(message => message.seq));
+      if (!opts?.beforeSeq && Number.isFinite(oldestLoadedSeq)) {
+        let items = page.items;
+        while (page.hasMore && page.nextCursor != null && page.nextCursor > oldestLoadedSeq) {
+          if (request !== messageRequest || get().userId !== userId) return;
+          const previousCursor = page.nextCursor;
+          page = await imApi.getMessages(conversationId, { beforeSeq: previousCursor, limit: 40, userId });
+          items = mergeMessages(page.items, items);
+          if (page.hasMore && (page.nextCursor == null || page.nextCursor >= previousCursor)) throw new Error("history cursor did not advance");
+        }
+        page = { ...page, items };
+      }
+      if (request !== messageRequest || get().activeConversationId !== conversationId || get().userId !== userId) return;
       if (opts?.beforeSeq) {
         // 加载更多 → 追加到头部
         set((s) => ({
-          messages: [...page.items, ...s.messages],
+          messages: mergeMessages(s.messages, page.items),
           messagesHasMore: page.hasMore,
           messagesNextCursor: page.nextCursor,
           messagesLoading: false,
         }));
       } else {
         // 首次加载 → 替换
-        set({
-          messages: page.items,
+        set((s) => ({
+          messages: mergeMessages(s.messages.filter(message =>
+            !requestedIds.has(message.id) || (page.hasMore && message.seq < (page.items[0]?.seq ?? 0))), page.items),
           messagesHasMore: page.hasMore,
           messagesNextCursor: page.nextCursor,
           messagesLoading: false,
-        });
+        }));
       }
+      await get().markAsRead(conversationId);
     } catch (e) {
       console.error("[IM] loadMessages failed:", e);
-      set({ messagesLoading: false });
+      if (request === messageRequest) set({ messagesLoading: false });
     }
   },
 
@@ -174,11 +209,12 @@ export const useImStore = create<ImStore>((set, get) => ({
 
   appendMessage: (msg) => {
     set((s) => ({
-      messages: [...s.messages, msg],
+      messages: s.activeConversationId === msg.conversationId ? mergeMessages(s.messages, [msg]) : s.messages,
       // 更新会话的 latestSeq 和 preview
       conversations: s.conversations.map((c) =>
         c.id === msg.conversationId
-          ? { ...c, latestSeq: msg.seq, preview: msg.content.slice(0, 200), updatedAt: msg.createdAt }
+          ? { ...c, latestSeq: Math.max(c.latestSeq, msg.seq),
+              ...(msg.seq >= c.latestSeq ? { preview: msg.content.slice(0, 200), updatedAt: msg.createdAt } : {}) }
           : c
       ),
     }));
@@ -208,8 +244,11 @@ export const useImStore = create<ImStore>((set, get) => ({
         sidechainId: opts?.sidechainId,
         replyGroupId: opts?.replyGroupId,
         replyToSeq: opts?.replyToSeq,
+        clientRequestId: opts?.clientRequestId,
+        attachmentIds: opts?.attachmentIds,
       });
       get().appendMessage(msg);
+      if (get().userId === userId) void get().markAsRead(activeConversationId).catch(console.error);
     } catch (e) {
       console.error("[IM] sendMessage failed:", e);
       throw e;
@@ -230,10 +269,13 @@ export const useImStore = create<ImStore>((set, get) => ({
 
   // 已读/未读
   markAsRead: async (conversationId) => {
-    const { userId, messages } = get();
+    const { userId, messages, activeConversationId } = get();
+    if (activeConversationId !== conversationId || !messages.length) return;
     const latestSeq = messages.length > 0 ? messages[messages.length - 1].seq : 0;
     await imApi.markAsRead(conversationId, userId, latestSeq);
 
+    if (get().userId !== userId) return;
+    unreadRequest++;
     set((s) => {
       const newCounts = new Map(s.unreadCounts);
       newCounts.set(conversationId, 0);
@@ -242,6 +284,7 @@ export const useImStore = create<ImStore>((set, get) => ({
   },
 
   loadUnreadCounts: async () => {
+    const request = ++unreadRequest;
     try {
       const { userId } = get();
       const counts = await imApi.getUnreadCounts(userId);
@@ -249,7 +292,7 @@ export const useImStore = create<ImStore>((set, get) => ({
       for (const c of counts) {
         if (c.unread > 0) map.set(c.conversationId, c.unread);
       }
-      set({ unreadCounts: map });
+      if (get().userId === userId && request === unreadRequest) set({ unreadCounts: map });
     } catch (e) {
       console.error("[IM] loadUnreadCounts failed:", e);
     }
@@ -257,17 +300,21 @@ export const useImStore = create<ImStore>((set, get) => ({
 
   // 搜索
   search: async (query, conversationId) => {
+    const version = ++searchVersion;
+    const userId = get().userId;
     set({ searchLoading: true, searchQuery: query });
     try {
-      const results = await imApi.search(query, conversationId);
+      const results = await imApi.search(query, conversationId, userId);
+      if (version !== searchVersion || userId !== get().userId) return;
       set({ searchResults: results, searchLoading: false });
     } catch (e) {
+      if (version !== searchVersion || userId !== get().userId) return;
       console.error("[IM] search failed:", e);
       set({ searchLoading: false });
     }
   },
 
-  clearSearch: () => set({ searchResults: [], searchQuery: "", searchLoading: false }),
+  clearSearch: () => { searchVersion++; set({ searchResults: [], searchQuery: "", searchLoading: false }); },
 
   // 表情
   addReaction: async (messageId, emoji) => {
@@ -331,9 +378,11 @@ export const useImStore = create<ImStore>((set, get) => ({
               if (page.items.length === 0) return;
               const msg = page.items[0];
               const current = get();
+              if (current.userId !== state.userId || current.activeConversationId !== convId) return;
               if (!current.messages.some((m) => m.id === msg.id)) {
                 current.appendMessage(msg);
               }
+              void current.markAsRead(convId).catch(console.error);
             })
             .catch((e) => console.error("[IM] fetch new message failed:", e));
         }
@@ -354,9 +403,13 @@ export const useImStore = create<ImStore>((set, get) => ({
       case "im.message.deleted": {
         const msgId = eventData.messageId as number;
         if (msgId) state.removeMessage(msgId);
+        void state.loadConversations();
+        if (state.searchQuery) void state.search(state.searchQuery);
         break;
       }
       case "im.message.edited": {
+        void state.loadConversations();
+        if (state.searchQuery) void state.search(state.searchQuery);
         const msgId = eventData.messageId as number;
         if (msgId) {
           // 通过 API 拿最新内容（事件 payload 可能不含完整 content）
@@ -381,7 +434,7 @@ export const useImStore = create<ImStore>((set, get) => ({
         // Typing 事件 → 记录到 typingUsers，2 秒后自动清除
         const convId = eventData.conversationId as string;
         const typingUserId = (eventData as any).userId as string;
-        if (convId && typingUserId && convId === state.activeConversationId) {
+        if (convId && typingUserId && typingUserId !== state.userId && convId === state.activeConversationId) {
           set((s) => {
             const next = new Map(s.typingUsers);
             next.set(typingUserId, Date.now() + 2000);

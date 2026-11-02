@@ -6,6 +6,7 @@
  */
 
 import { apiPath } from "./api";
+import type { ImTask, ImExecutionSettings, ImAttachment } from "@termany/core";
 
 // ─── 类型定义（与后端 imTypes.ts 对齐） ──────────────────
 
@@ -21,6 +22,17 @@ export interface ImConversation {
   memberCount: number;
 }
 
+export interface ImContact { id: string; name: string; type: "user" | "bot" }
+export interface ImCapabilities { llmConfigured: boolean; agents: Array<{ id: string; available: boolean; reason?: string }> }
+export interface ImMember { conversationId: string; userOrBotId: string; memberType: "user" | "bot"; role: "owner" | "admin" | "member"; joinedAt: number }
+export interface ImHandoffPreview {
+  previewId: string;
+  snapshot: { snapshotId: string; requestedMode: "rules" | "llm"; distillMode: "rules" | "llm"; warnings: string[] };
+  rendered: string;
+}
+export interface ImHandoffResult { taskId: string; targetConversationId: string; status: string; renderedContent: string }
+export interface ImHandoffOptions { userId?: string; handoffNote?: string; projectPath?: string; mode?: "rules" | "llm"; previewId?: string }
+
 export interface ImMessage {
   id: number;
   conversationId: string;
@@ -30,7 +42,7 @@ export interface ImMessage {
   senderId: string;
   content: string;
   messageType: "text" | "file" | "image" | "system";
-  metadata: Record<string, unknown>;
+  metadata: Record<string, unknown> & { attachments?: ImAttachment[] };
   replyToSeq: number | null;
   isDeleted: boolean;
   editedAt: number | null;
@@ -107,6 +119,40 @@ function get<T>(path: string): Promise<T> {
 // ─── 会话 API ───────────────────────────────────────────
 
 export const imApi = {
+  async uploadAttachment(conversationId: string, userId: string, file: File): Promise<ImAttachment> {
+    if (file.size > 10 * 1024 * 1024 || !file.size) throw new Error("附件大小需为 1 字节至 10 MB");
+    return request(`/im/conversations/${conversationId}/attachments?user_id=${encodeURIComponent(userId)}`, {
+      method: "POST", headers: { "Content-Type": "application/octet-stream", "X-File-Name": encodeURIComponent(file.name) }, body: file,
+    });
+  },
+  attachmentUrl(id: string, userId: string, preview = false) {
+    return imPath(`/im/attachments/${encodeURIComponent(id)}${preview ? "/preview" : ""}?user_id=${encodeURIComponent(userId)}`);
+  },
+  listTasks(conversationId: string, userId: string) {
+    return get<ImTask[]>(`/im/conversations/${conversationId}/tasks?user_id=${encodeURIComponent(userId)}`);
+  },
+  cancelTask(id: string, userId: string) { return post<void>(`/im/tasks/${id}/cancel`, { userId }); },
+  retryTask(id: string, userId: string) { return post<ImTask>(`/im/tasks/${id}/retry`, { userId }); },
+  respondTaskPermission(id: string, userId: string, requestId: string, optionId: string) {
+    return post<void>(`/im/tasks/${id}/permission`, { userId, requestId, optionId });
+  },
+  executionSettings(conversationId: string, userId: string) {
+    return get<ImExecutionSettings>(`/im/conversations/${conversationId}/execution-settings?user_id=${encodeURIComponent(userId)}`);
+  },
+  configureExecution(conversationId: string, userId: string, settings: ImExecutionSettings) {
+    return put<ImExecutionSettings>(`/im/conversations/${conversationId}/execution-settings`, { userId, settings });
+  },
+  listContacts(): Promise<ImContact[]> { return get("/im/contacts"); },
+  capabilities(): Promise<ImCapabilities> { return get("/im/capabilities"); },
+  changeMember(conversationId: string, userId: string, targetId: string, remove = false) {
+    return request<ImMember[]>(`/im/conversations/${conversationId}/members`, { method: remove ? "DELETE" : "POST", body: JSON.stringify({ userId, targetId }) });
+  },
+  listMembers(conversationId: string, userId: string): Promise<ImMember[]> {
+    return get(`/im/conversations/${conversationId}/members?user_id=${encodeURIComponent(userId)}`);
+  },
+  pinMessage(messageId: number, pinned: boolean, userId = "default-user") {
+    return post<void>(`/im/messages/${messageId}/pin`, { pinned, userId });
+  },
   // 会话列表
   listConversations(userId = "default-user"): Promise<ImConversation[]> {
     return get(`/im/conversations?user_id=${encodeURIComponent(userId)}`);
@@ -134,6 +180,7 @@ export const imApi = {
     clientRequestId?: string;
     sidechainId?: string;
     replyGroupId?: string;
+    attachmentIds?: string[];
   }) {
     return post<ImMessage>(`/im/conversations/${conversationId}/messages`, {
       senderId: opts.senderId,
@@ -144,6 +191,8 @@ export const imApi = {
       clientRequestId: opts.clientRequestId,
       sidechainId: opts.sidechainId,
       replyGroupId: opts.replyGroupId,
+      attachmentIds: opts.attachmentIds,
+      messageType: opts.attachmentIds?.length ? "file" : "text",
     });
   },
 
@@ -180,9 +229,10 @@ export const imApi = {
 
   // ─── 搜索 ─────────────────────────────────────────────
 
-  search(query: string, conversationId?: string): Promise<SearchResult[]> {
+  search(query: string, conversationId?: string, userId = "default-user"): Promise<SearchResult[]> {
     const params = new URLSearchParams({ q: query });
     if (conversationId) params.set("conversation_id", conversationId);
+    params.set("user_id", userId);
     return get(`/im/search?${params}`);
   },
 
@@ -221,29 +271,32 @@ export const imApi = {
 
   // ─── 侧链 ─────────────────────────────────────────────
 
-  createSidechain(conversationId: string) {
-    return post<{ sidechainId: string }>(`/im/conversations/${conversationId}/sidechains`, {});
+  createSidechain(conversationId: string, userId = "default-user") {
+    return post<{ sidechainId: string }>(`/im/conversations/${conversationId}/sidechains?user_id=${encodeURIComponent(userId)}`, {});
   },
 
-  getSidechainMessages(conversationId: string, sidechainId: string) {
-    return get<ImMessage[]>(`/im/conversations/${conversationId}/sidechains/${sidechainId}`);
+  getSidechainMessages(conversationId: string, sidechainId: string, userId = "default-user") {
+    return get<ImMessage[]>(`/im/conversations/${conversationId}/sidechains/${sidechainId}?user_id=${encodeURIComponent(userId)}`);
   },
 
-  listSidechains(conversationId: string) {
-    return get<string[]>(`/im/conversations/${conversationId}/sidechains`);
+  listSidechains(conversationId: string, userId = "default-user") {
+    return get<string[]>(`/im/conversations/${conversationId}/sidechains?user_id=${encodeURIComponent(userId)}`);
   },
 
   // ─── Handoff ──────────────────────────────────────────
 
-  handoffPreview(conversationId: string, sourceAgentId: string, targetAgent: "codex" | "claude-code", opts: { handoffNote?: string; projectPath?: string } = {}) {
-    return post<{ snapshot: unknown; rendered: string }>("/im/handoffs/preview", {
+  handoffPreview(conversationId: string, sourceAgentId: string, targetAgent: string, opts: ImHandoffOptions = {}) {
+    return post<ImHandoffPreview>("/im/handoffs/preview", {
       conversationId, sourceAgentId, targetAgent, ...opts,
     });
   },
 
-  executeHandoff(conversationId: string, sourceAgentId: string, targetAgent: "codex" | "claude-code", opts: { handoffNote?: string; projectPath?: string } = {}) {
-    return post<{ snapshot: unknown; renderedContent: string }>("/im/handoffs", {
+  executeHandoff(conversationId: string, sourceAgentId: string, targetAgent: string, opts: ImHandoffOptions = {}) {
+    return post<ImHandoffResult>("/im/handoffs", {
       conversationId, sourceAgentId, targetAgent, ...opts,
     });
+  },
+  listHandoffs(conversationId: string, userId: string) {
+    return get<Array<ImHandoffResult & { snapshot: { snapshotId: string; target: string } }>>(`/im/handoffs?conversation_id=${encodeURIComponent(conversationId)}&user_id=${encodeURIComponent(userId)}`);
   },
 };
